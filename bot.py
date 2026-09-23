@@ -8,7 +8,8 @@ from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           CallbackQueryHandler, filters, ContextTypes, ConversationHandler)
 
 logging.basicConfig(level=logging.INFO)
-BOT_TOKEN = "ВАШ_ТОКЕН"
+import os
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WAITING_COOKIE, WAITING_CHOICE = range(2)
 
 # Увеличиваем до 20 потоков
