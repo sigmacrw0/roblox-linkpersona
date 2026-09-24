@@ -1,20 +1,33 @@
 import os
-import requests
-import logging
 import re
+import logging
+import requests
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
-                          CallbackQueryHandler, filters, ContextTypes, ConversationHandler)
+                          CallbackQueryHandler, filters, ContextTypes,
+                          ConversationHandler)
 
 logging.basicConfig(level=logging.INFO)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WAITING_COOKIE, WAITING_CHOICE = range(2)
+CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")  # Токен от @CryptoBot
+
 executor = ThreadPoolExecutor(max_workers=20)
 
-# Храним пользователей которые уже приняли правила
+# Хранилище
 accepted_users = set()
+user_attempts = {}    # user_id: int
+pending_payments = {} # invoice_id: {user_id, attempts}
+
+# Состояния
+(WAITING_RULES, WAITING_MENU, WAITING_COOKIE,
+ WAITING_BUY_AMOUNT, WAITING_PAYMENT) = range(5)
+
+PRICE_PER_ATTEMPT = 0.20
+DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
 
 INJECT_SCRIPT = """
 (function() {
@@ -131,7 +144,6 @@ def playwright_get_url(cookie: str, method: str):
             page.wait_for_timeout(3000)
 
             target_text = "Continue with camera" if method == "camera" else "Continue with ID"
-
             clicked = False
             for attempt in range(3):
                 try:
@@ -175,28 +187,58 @@ def playwright_get_url(cookie: str, method: str):
 
             browser.close()
             return result_url
-
     except Exception as e:
         logging.error(f"Ошибка: {e}")
         return f"ERROR: {e}"
 
+def create_invoice(amount: float, attempts: int, user_id: int):
+    try:
+        r = requests.post(
+            "https://pay.crypt.bot/api/createInvoice",
+            headers={"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN},
+            json={
+                "asset": "USDT",
+                "amount": str(round(amount, 2)),
+                "description": f"Покупка {attempts} попыток | Roblox Verify Bot",
+                "expires_in": 300,
+            }
+        )
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]
+        return None
+    except Exception as e:
+        logging.error(f"CryptoBot error: {e}")
+        return None
 
-# ===== TELEGRAM =====
+def check_invoice(invoice_id: str):
+    try:
+        r = requests.get(
+            "https://pay.crypt.bot/api/getInvoices",
+            headers={"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN},
+            params={"invoice_ids": invoice_id}
+        )
+        data = r.json()
+        if data.get("ok") and data["result"]["items"]:
+            return data["result"]["items"][0]
+        return None
+    except:
+        return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# ===== МЕНЮ =====
 
-    # Если уже принял правила — показываем главное меню
-    if user_id in accepted_users:
-        await show_main_menu(update, context)
-        return WAITING_CHOICE
+def get_main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Получить ссылку", callback_data="get_link")],
+        [InlineKeyboardButton("🛒 Купить попытки", callback_data="buy")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+    ])
 
-    # Первый раз — показываем правила
+async def show_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Принять и продолжить", callback_data="accept_rules")]
     ])
-
-    await update.message.reply_text(
+    text = (
         "👋 *Добро пожаловать!*\n\n"
         "Этот бот помогает получать и проверять ссылки для официальной верификации аккаунтов Roblox.\n\n"
         "⚠️ *Важно:*\n"
@@ -204,75 +246,233 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Используйте только официальные кук сессии Roblox.\n"
         "• Администрация бота не имеет отношения к Roblox Corporation.\n\n"
         "📋 *Политика использования*\n\n"
-        "1. Пользователь самостоятельно принимает решение об использовании бота.\n"
-        "2. Администрация бота не несёт ответственности за действия пользователей на сторонних сайтах.\n"
-        "3. Администрация бота не несёт ответственности за кук файлы.\n"
-        "4. Бот предназначен исключительно для законных целей и не создан для нарушения правил Roblox, законодательства Российской Федерации или законодательства других государств.\n"
-        "5. Администрация бота заявляет, что функционал бота не направлен на нарушение законодательства Российской Федерации, а также не содержит призывов к совершению противоправных действий.\n"
-        "6. Пользователь самостоятельно несёт ответственность за свои действия при использовании бота и обязан соблюдать действующее законодательство.\n\n"
+        "1\\. Пользователь самостоятельно принимает решение об использовании бота\\.\n"
+        "2\\. Администрация бота не несёт ответственности за действия пользователей на сторонних сайтах\\.\n"
+        "3\\. Администрация бота не несёт ответственности за кук файлы\\.\n"
+        "4\\. Бот предназначен исключительно для законных целей\\.\n"
+        "5\\. Администрация бота заявляет, что функционал бота не направлен на нарушение законодательства\\.\n"
+        "6\\. Пользователь самостоятельно несёт ответственность за свои действия при использовании бота\\.\n\n"
         "📌 *Соглашение*\n\n"
-        "Нажимая кнопку «✅ Принять и продолжить», вы подтверждаете, что ознакомились с правилами, "
-        "принимаете условия использования сервиса и обязуетесь использовать бота только в законных целях.\n\n"
-        "Для продолжения работы нажмите кнопку ниже:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
+        "Нажимая кнопку «✅ Принять и продолжить», вы подтверждаете что ознакомились с правилами "
+        "и обязуетесь использовать бота только в законных целях\\.\n\n"
+        "Для продолжения работы нажмите кнопку ниже:"
     )
-    return WAITING_CHOICE
-
-
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📷 Лицо (Camera)", callback_data="choose_camera")],
-        [InlineKeyboardButton("🪪 Паспорт (ID)", callback_data="choose_id")],
-    ])
-
-    text = (
-        "👋 *Roblox Age Verification Bot*\n\n"
-        "Сервис для получения ссылки by @dedbed12\n\n"
-        "🔢 Ваши попытки: *999*\n\n"
-        "Выберите действие ниже:"
-    )
-
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
+            text, parse_mode="MarkdownV2", reply_markup=keyboard
         )
     else:
         await update.message.reply_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
+            text, parse_mode="MarkdownV2", reply_markup=keyboard
         )
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    attempts = user_attempts.get(user_id, 0)
+    text = (
+        "👋 *Roblox Age Verification Bot*\n\n"
+        "Сервис для получения ссылки by @dedbed12\n\n"
+        f"🔢 Ваши попытки: *{attempts}*\n\n"
+        "Выберите действие ниже:"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
+        )
+
+# ===== HANDLERS =====
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_welcome(update, context)
+    return WAITING_RULES
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    data = query.data
 
     # Принятие правил
-    if query.data == "accept_rules":
+    if data == "accept_rules":
         accepted_users.add(user_id)
         await show_main_menu(update, context)
-        return WAITING_CHOICE
+        return WAITING_MENU
 
-    # Выбор метода
-    if query.data in ["choose_camera", "choose_id"]:
-        method = "camera" if query.data == "choose_camera" else "id"
-        method_name = "📷 Лицо (Camera)" if method == "camera" else "🪪 Паспорт (ID)"
-        context.user_data["method"] = method
+    # Главное меню
+    if data == "main_menu":
+        await show_main_menu(update, context)
+        return WAITING_MENU
+
+    # Помощь
+    if data == "help":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(
+            "❓ *Помощь*\n\n"
+            "*Как пользоваться:*\n"
+            "1\\. Купите попытки или активируйте промокод\n"
+            "2\\. Нажмите «Получить ссылку»\n"
+            "3\\. Отправьте кук `.ROBLOSECURITY`\n"
+            "4\\. Выберите Camera или ID\n"
+            "5\\. Получите ссылку на верификацию\n\n"
+            "*Важно:*\n"
+            "• Отправляйте только `.ROBLOSECURITY`\n"
+            "• При технической ошибке попытка возвращается\n"
+            "• При невалидной сессии \\— возвращается попытка",
+            parse_mode="MarkdownV2",
+            reply_markup=keyboard
+        )
+        return WAITING_MENU
+
+    # Купить попытки
+    if data == "buy":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 попытка — $0.20", callback_data="buy_1")],
+            [InlineKeyboardButton("5 попыток — $0.95 (−5%)", callback_data="buy_5")],
+            [InlineKeyboardButton("10 попыток — $1.80 (−10%)", callback_data="buy_10")],
+            [InlineKeyboardButton("25 попыток — $4.25 (−15%)", callback_data="buy_25")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")],
+        ])
+        await query.edit_message_text(
+            "🛒 *Покупка попыток*\n\n"
+            "Цена за 1 попытку: *$0\\.20*\n\n"
+            "*Скидки на пакеты:*\n"
+            "• 5 попыток: 5%\n"
+            "• 10 попыток: 10%\n"
+            "• 25 попыток: 15%\n\n"
+            "Скидка действует только при выборе кнопки\\.\n"
+            "При своём количестве скидки нет\\.\n\n"
+            "Выберите количество:",
+            parse_mode="MarkdownV2",
+            reply_markup=keyboard
+        )
+        return WAITING_BUY_AMOUNT
+
+    # Выбор пакета
+    if data.startswith("buy_"):
+        count = int(data.split("_")[1])
+        discount = DISCOUNTS.get(count, 0)
+        total = round(count * PRICE_PER_ATTEMPT * (1 - discount), 2)
 
         await query.edit_message_text(
+            f"⏳ Создаю инвойс на {count} попыток\\.\\.\\.",
+            parse_mode="MarkdownV2"
+        )
+
+        invoice = create_invoice(total, count, user_id)
+
+        if not invoice:
+            await query.edit_message_text(
+                "❌ Ошибка создания инвойса\\. Попробуй позже\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Назад", callback_data="buy")]
+                ])
+            )
+            return WAITING_MENU
+
+        invoice_id = str(invoice["invoice_id"])
+        pay_url = invoice["pay_url"]
+        pending_payments[invoice_id] = {
+            "user_id": user_id,
+            "attempts": count
+        }
+        context.user_data["invoice_id"] = invoice_id
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Оплатить", url=pay_url)],
+            [InlineKeyboardButton("✅ Я оплатил", callback_data=f"check_{invoice_id}")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="buy")],
+        ])
+        await query.edit_message_text(
+            f"💳 *Оплата через CryptoBot*\n\n"
+            f"Инвойс: `{invoice_id}`\n"
+            f"Попыток: *{count}*\n"
+            f"Сумма: *${total}*\n\n"
+            f"Нажмите кнопку ниже для оплаты в USDT\\.\n"
+            f"После оплаты нажмите «Я оплатил», попытки зачислятся сразу\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=keyboard
+        )
+        return WAITING_PAYMENT
+
+    # Проверка оплаты
+    if data.startswith("check_"):
+        invoice_id = data.replace("check_", "")
+        invoice = check_invoice(invoice_id)
+
+        if invoice and invoice.get("status") == "paid":
+            payment = pending_payments.pop(invoice_id, None)
+            if payment:
+                attempts_count = payment["attempts"]
+                user_attempts[user_id] = user_attempts.get(user_id, 0) + attempts_count
+                await query.edit_message_text(
+                    f"✅ *Оплата подтверждена!*\n\n"
+                    f"Зачислено попыток: *{attempts_count}*\n"
+                    f"Всего попыток: *{user_attempts[user_id]}*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("◀️ В меню", callback_data="main_menu")]
+                    ])
+                )
+            else:
+                await query.edit_message_text("✅ Оплата уже была обработана!")
+        else:
+            await query.answer("❌ Оплата не найдена. Подожди и попробуй снова.", show_alert=True)
+        return WAITING_MENU
+
+    # Получить ссылку
+    if data == "get_link":
+        user_id = update.effective_user.id
+        attempts = user_attempts.get(user_id, 0)
+        if attempts <= 0:
+            await query.edit_message_text(
+                "❌ *У вас нет попыток!*\n\n"
+                "Купите попытки чтобы продолжить.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛒 Купить попытки", callback_data="buy")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")],
+                ])
+            )
+            return WAITING_MENU
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📷 Лицо (Camera)", callback_data="choose_camera")],
+            [InlineKeyboardButton("🪪 Паспорт (ID)", callback_data="choose_id")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")],
+        ])
+        await query.edit_message_text(
+            f"🔗 *Получить ссылку*\n\n"
+            f"🔢 Ваши попытки: *{attempts}*\n\n"
+            "Выберите метод верификации:",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return WAITING_MENU
+
+    # Выбор метода
+    if data in ["choose_camera", "choose_id"]:
+        method = "camera" if data == "choose_camera" else "id"
+        method_name = "📷 Лицо (Camera)" if method == "camera" else "🪪 Паспорт (ID)"
+        context.user_data["method"] = method
+        await query.edit_message_text(
             f"✅ Выбран метод: *{method_name}*\n\n"
-            f"Теперь отправь свой `.ROBLOSECURITY` cookie\n\n"
+            f"Отправь свой `.ROBLOSECURITY` cookie\n\n"
             f"⚠️ Сообщение с cookie будет удалено автоматически",
             parse_mode="Markdown"
         )
         return WAITING_COOKIE
 
-    return WAITING_CHOICE
+    return WAITING_MENU
 
 
 async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,13 +480,19 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     method = context.user_data.get("method")
     user_id = update.effective_user.id
 
-    # Если не принял правила
     if user_id not in accepted_users:
         await update.message.reply_text("❌ Сначала прими правила! /start")
         return ConversationHandler.END
 
     if not method:
         await update.message.reply_text("❌ Сначала выбери метод! /start")
+        return ConversationHandler.END
+
+    attempts = user_attempts.get(user_id, 0)
+    if attempts <= 0:
+        await update.message.reply_text(
+            "❌ У вас нет попыток!\n\nКупите попытки через /start → 🛒 Купить"
+        )
         return ConversationHandler.END
 
     try:
@@ -301,85 +507,30 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = s.get("https://users.roblox.com/v1/users/authenticated")
 
     if r.status_code != 200:
-        await msg.edit_text("❌ Неверный cookie!\n\n/start чтобы попробовать снова")
+        await msg.edit_text(
+            "❌ Неверный cookie — попытка возвращена!\n\n/start чтобы попробовать снова"
+        )
         return ConversationHandler.END
 
     user = r.json()
     method_name = "📷 Camera" if method == "camera" else "🪪 ID"
 
+    # Списываем попытку
+    user_attempts[user_id] -= 1
+
     await msg.edit_text(
         f"✅ Аккаунт: *{user['name']}*\n"
-        f"🔍 Метод: *{method_name}*\n\n"
+        f"🔍 Метод: *{method_name}*\n"
+        f"🔢 Осталось попыток: *{user_attempts[user_id]}*\n\n"
         f"⏳ Получаю ссылку, жди 20-30 сек...",
         parse_mode="Markdown"
     )
 
-    import asyncio
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
     if isinstance(result, str) and result.startswith("ERROR"):
-        await msg.edit_text("❌ Ошибка браузера\n\n/start чтобы попробовать снова")
-    elif result == "NOT_CLICKED":
-        await msg.edit_text("❌ Кнопка не найдена\n\n/start чтобы попробовать снова")
-    elif result and "withpersona.com" in result:
+        # Возвращаем попытку при ошибке
+        user_attempts[user_id] += 1
         await msg.edit_text(
-            "✅ *Ссылка получена!*\n\n"
-            "⚠️ Используй сразу — одноразовая!",
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text(result)
-    else:
-        await msg.edit_text(
-            "❌ Не удалось получить ссылку\n\n"
-            "/start чтобы попробовать снова"
-        )
-
-    # После получения — показываем меню снова
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📷 Лицо (Camera)", callback_data="choose_camera")],
-        [InlineKeyboardButton("🪪 Паспорт (ID)", callback_data="choose_id")],
-    ])
-    await update.message.reply_text(
-        "👋 *Roblox Age Verification Bot*\n\n"
-        "Сервис для получения ссылки by @dedbed12\n\n"
-        "🔢 Ваши попытки: *999*\n\n"
-        "Выберите действие ниже:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-    return WAITING_CHOICE
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Отменено. /start чтобы начать")
-    return ConversationHandler.END
-
-
-def main():
-    import asyncio
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            WAITING_CHOICE: [
-                CallbackQueryHandler(handle_callback),
-            ],
-            WAITING_COOKIE: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_cookie),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True,
-        per_chat=True,
-        block=False,
-    )
-    app.add_handler(conv)
-    print("🤖 Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+          
