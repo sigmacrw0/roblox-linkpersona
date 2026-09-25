@@ -141,6 +141,87 @@ def build_url(data):
     return None
 
 
+# Все переводы кнопок Roblox на разных языках
+CAMERA_TEXTS = [
+    "Continue with camera",       # English
+    "Continuar con la camara",    # Spanish
+    "Continuar com camera",       # Portuguese
+    "Continuer avec la camera",   # French
+    "Mit Kamera fortfahren",      # German
+    "Continua con la fotocamera", # Italian
+    "Продолжить с камерой",       # Russian
+    "Doorgaan met camera",        # Dutch
+    "Kontynuuj z kamera",         # Polish
+    "Kamerayla devam et",         # Turkish
+    "Devam et kamera",            # Turkish alt
+    "Lanjutkan dengan kamera",    # Indonesian
+    "Tiep tuc voi camera",        # Vietnamese
+    "Magpatuloy sa camera",       # Filipino
+    "Devam kamera",               # Turkish short
+    "camera",                     # Fallback partial
+]
+
+ID_TEXTS = [
+    "Continue with ID",           # English
+    "Continuar con ID",           # Spanish
+    "Continuar com ID",           # Portuguese
+    "Continuer avec ID",          # French
+    "Mit Ausweis fortfahren",     # German
+    "Continua con ID",            # Italian
+    "Продолжить с удостоверением",# Russian
+    "Doorgaan met ID",            # Dutch
+    "Kontynuuj z dowodem",        # Polish
+    "Kimlikle devam et",          # Turkish
+    "Lanjutkan dengan ID",        # Indonesian
+    "Government ID",              # English alt
+    "ID document",                # English alt 2
+    "Continue with ID document",  # English full
+    "ID",                         # Fallback partial
+]
+
+# Кнопки Continue/Reset которые могут появиться после
+CONTINUE_TEXTS = [
+    "Continue", "Continuar", "Continuer", "Fortfahren",
+    "Continua", "Продолжить", "Doorgaan", "Kontynuuj",
+    "Devam et", "Lanjutkan", "Tiep tuc", "Magpatuloy",
+    "Next", "Siguiente", "Suivant", "Weiter", "Avanti",
+    "Далее", "Volgende", "Dalej",
+]
+
+RESET_TEXTS = [
+    "Reset", "Restablecer", "Reinitialiser", "Zurucksetzen",
+    "Reimposta", "Сбросить", "Opnieuw", "Zresetuj",
+    "Sifirla", "Atur ulang",
+]
+
+
+def click_any_text(page, texts):
+    js = """(texts) => {
+        var els = document.querySelectorAll('button, a, div[role=button], span[role=button]');
+        for (var i = 0; i < els.length; i++) {
+            var t = els[i].textContent.trim();
+            for (var j = 0; j < texts.length; j++) {
+                if (t === texts[j] || t.toLowerCase() === texts[j].toLowerCase()) {
+                    els[i].click(); return texts[j];
+                }
+            }
+        }
+        for (var i = 0; i < els.length; i++) {
+            var t = els[i].textContent.trim().toLowerCase();
+            for (var j = 0; j < texts.length; j++) {
+                if (t.indexOf(texts[j].toLowerCase()) !== -1) {
+                    els[i].click(); return texts[j];
+                }
+            }
+        }
+        return null;
+    }"""
+    try:
+        return page.evaluate(js, texts)
+    except Exception:
+        return None
+
+
 def playwright_get_url(cookie, method):
     try:
         with sync_playwright() as p:
@@ -164,30 +245,16 @@ def playwright_get_url(cookie, method):
             )
             page.wait_for_timeout(3000)
 
-            target_text = "Continue with camera" if method == "camera" else "Continue with ID"
+            # Выбираем список текстов кнопок по методу
+            target_texts = CAMERA_TEXTS if method == "camera" else ID_TEXTS
+
+            # Шаг 1: Нажимаем основную кнопку (Continue with camera / ID)
             clicked = False
             for _ in range(3):
-                try:
-                    clicked = page.evaluate(
-                        """(txt) => {
-                            var els = document.querySelectorAll('button, a, div, span');
-                            for (var i = 0; i < els.length; i++) {
-                                if (els[i].textContent.trim() === txt) {
-                                    els[i].click(); return true;
-                                }
-                            }
-                            for (var i = 0; i < els.length; i++) {
-                                if (els[i].textContent.trim().toLowerCase().indexOf(txt.toLowerCase()) !== -1) {
-                                    els[i].click(); return true;
-                                }
-                            }
-                            return false;
-                        }""",
-                        target_text
-                    )
-                except Exception:
-                    clicked = False
-                if clicked:
+                result = click_any_text(page, target_texts)
+                if result:
+                    logging.info("Нажата кнопка: " + str(result))
+                    clicked = True
                     break
                 page.wait_for_timeout(2000)
 
@@ -195,17 +262,32 @@ def playwright_get_url(cookie, method):
                 browser.close()
                 return "NOT_CLICKED"
 
+            # Шаг 2: Ждём и нажимаем Continue если появилась
+            page.wait_for_timeout(2000)
+            cont = click_any_text(page, CONTINUE_TEXTS)
+            if cont:
+                logging.info("Нажата кнопка Continue: " + str(cont))
+                page.wait_for_timeout(1500)
+
+            # Шаг 3: Ждём ссылку 25 секунд
             result_url = None
-            for _ in range(25):
+            for i in range(25):
                 page.wait_for_timeout(1000)
                 try:
                     raw = page.evaluate("() => window.__capturedData")
                     if raw:
                         result_url = build_url(raw)
                         if result_url:
+                            logging.info("Ссылка за " + str(i+1) + " сек")
                             break
                 except Exception:
                     pass
+
+                # Если появилась кнопка Continue — нажимаем
+                if i % 3 == 0:
+                    c = click_any_text(page, CONTINUE_TEXTS)
+                    if c:
+                        logging.info("Нажата Continue на шаге " + str(i))
 
             browser.close()
             return result_url
@@ -261,15 +343,8 @@ def main_menu_kb():
 
 
 async def show_welcome(update, context):
-    user_id = update.effective_user.id
-    if user_id in accepted_users:
-        btn_text = "Продолжить"
-        btn_data = "main_menu"
-    else:
-        btn_text = "Принять и продолжить"
-        btn_data = "accept_rules"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(btn_text, callback_data=btn_data)]
+        [InlineKeyboardButton("Открыть меню", callback_data="accept_rules")]
     ])
     text = (
         "*Добро пожаловать!*\n\n"
@@ -318,6 +393,8 @@ async def show_main_menu(update, context):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    accepted_users.add(user_id)  # Автоматически принимаем правила
     await show_welcome(update, context)
     return WAITING_RULES
 
