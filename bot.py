@@ -261,8 +261,15 @@ def main_menu_kb():
 
 
 async def show_welcome(update, context):
+    user_id = update.effective_user.id
+    if user_id in accepted_users:
+        btn_text = "Продолжить"
+        btn_data = "main_menu"
+    else:
+        btn_text = "Принять и продолжить"
+        btn_data = "accept_rules"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Принять и продолжить", callback_data="accept_rules")]
+        [InlineKeyboardButton(btn_text, callback_data=btn_data)]
     ])
     text = (
         "*Добро пожаловать!*\n\n"
@@ -514,13 +521,18 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if not method:
-        await update.message.reply_text("Сначала выбери метод! /start")
-        return ConversationHandler.END
+        await show_main_menu(update, context)
+        return WAITING_MENU
 
     attempts = user_attempts.get(user_id, 0)
     if attempts <= 0:
-        await update.message.reply_text("У вас нет попыток! Купите через /start")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "У вас нет попыток! Купите попытки.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Купить попытки", callback_data="buy")]
+            ])
+        )
+        return WAITING_MENU
 
     try:
         await update.message.delete()
@@ -534,10 +546,17 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = s.get("https://users.roblox.com/v1/users/authenticated")
 
     if r.status_code != 200:
-        await msg.edit_text(
-            "Неверный cookie - попытка возвращена!\n\n/start чтобы попробовать снова"
+        await msg.edit_text("Неверный cookie! Попробуй снова.")
+        attempts_now = user_attempts.get(user_id, 0)
+        await update.message.reply_text(
+            "*Roblox Age Verification Bot*\n\n"
+            "Сервис для получения ссылки by @dedbed12\n\n"
+            "Ваши попытки: *" + str(attempts_now) + "*\n\n"
+            "Выберите действие ниже:",
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb()
         )
-        return ConversationHandler.END
+        return WAITING_MENU
 
     user = r.json()
     method_name = "Camera" if method == "camera" else "ID"
@@ -610,7 +629,10 @@ def main():
             WAITING_BUY: [CallbackQueryHandler(handle_callback)],
             WAITING_PAYMENT: [CallbackQueryHandler(handle_callback)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
         per_user=True,
         per_chat=True,
         block=False,
