@@ -32,70 +32,90 @@ WAITING_PAYMENT = 4
 PRICE = 0.20
 DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
 
-INJECT_SCRIPT = (
-    "(function() {"
-    "window.__capturedData = null;"
-    "var TARGET = 'age-verification-service/v1/persona-id-verification/start-verification';"
-    "function extractLinks(text) {"
-    "  var links = [];"
-    "  try {"
-    "    var data = JSON.parse(text);"
-    "    var find = function(obj, path) {"
-    "      if (!obj || typeof obj !== 'object') return;"
-    "      for (var k in obj) {"
-    "        var cur = path ? path+'.'+k : k;"
-    "        var v = obj[k];"
-    "        if (typeof v === 'string') {"
-    "          if (k.toLowerCase().indexOf('url') !== -1 ||"
-    "              k.toLowerCase().indexOf('link') !== -1 ||"
-    "              k.toLowerCase().indexOf('inquiry') !== -1 ||"
-    "              v.indexOf('http') === 0) {"
-    "            links.push({ path: cur, url: v });"
-    "          }"
-    "        } else if (typeof v === 'object') { find(v, cur); }"
-    "      }"
-    "    };"
-    "    find(data, '');"
-    "  } catch(e) {"
-    "    var m = text.match(/https?:\\/\\/[^\\s\"'<>]+/g);"
-    "    if (m) m.forEach(function(u,i){ links.push({path:'match_'+i, url:u}); });"
-    "  }"
-    "  return links;"
-    "}"
-    "var _fetch = window.fetch;"
-    "window.fetch = async function() {"
-    "  var args = Array.prototype.slice.call(arguments);"
-    "  var url = typeof args[0]==='string' ? args[0] :"
-    "            args[0] instanceof Request ? args[0].url : String(args[0]);"
-    "  var method = ((args[1] && args[1].method) ||"
-    "               (args[0] instanceof Request ? args[0].method : 'GET')).toUpperCase();"
-    "  var res = await _fetch.apply(this, args);"
-    "  if (method === 'POST' && url.indexOf(TARGET) !== -1) {"
-    "    try {"
-    "      var body = await res.clone().text();"
-    "      window.__capturedData = { url: url, body: body, links: extractLinks(body) };"
-    "    } catch(e) {}"
-    "  }"
-    "  return res;"
-    "};"
-    "var _open = XMLHttpRequest.prototype.open;"
-    "var _send = XMLHttpRequest.prototype.send;"
-    "XMLHttpRequest.prototype.open = function(m,u){"
-    "  this._m=m; this._u=u; return _open.apply(this,arguments);"
-    "};"
-    "XMLHttpRequest.prototype.send = function(b){"
-    "  var self = this;"
-    "  if (this._m && this._m.toUpperCase()==='POST' && this._u && this._u.indexOf(TARGET)!==-1){"
-    "    this.addEventListener('loadend', function(){"
-    "      if (self.status >= 200 && self.status < 300){"
-    "        try { window.__capturedData = { url: self._u, body: self.responseText, links: extractLinks(self.responseText) }; } catch(e){}"
-    "      }"
-    "    }, {once:true});"
-    "  }"
-    "  return _send.apply(this,arguments);"
-    "};"
-    "})();"
-)
+INJECT_SCRIPT = r"""
+(function() {
+    window.__capturedData = null;
+    var TARGET = 'age-verification-service/v1/persona-id-verification/start-verification';
+
+    function extractLinks(text) {
+        var links = [];
+        try {
+            var data = JSON.parse(text);
+            var find = function(obj, path) {
+                if (!obj || typeof obj !== 'object') return;
+                for (var k in obj) {
+                    var cur = path ? path + '.' + k : k;
+                    var v = obj[k];
+                    if (typeof v === 'string') {
+                        if (k.toLowerCase().indexOf('url') !== -1 ||
+                            k.toLowerCase().indexOf('link') !== -1 ||
+                            k.toLowerCase().indexOf('inquiry') !== -1 ||
+                            v.indexOf('http') === 0) {
+                            links.push({ path: cur, url: v });
+                        }
+                    } else if (typeof v === 'object') {
+                        find(v, cur);
+                    }
+                }
+            };
+            find(data, '');
+        } catch(e) {
+            var m = text.match(/https?:\/\/[^\s"'<>]+/g);
+            if (m) {
+                for (var i = 0; i < m.length; i++) {
+                    links.push({ path: 'match_' + i, url: m[i] });
+                }
+            }
+        }
+        return links;
+    }
+
+    var _fetch = window.fetch;
+    window.fetch = async function() {
+        var args = Array.prototype.slice.call(arguments);
+        var url = typeof args[0] === 'string' ? args[0] :
+                  (args[0] instanceof Request ? args[0].url : String(args[0]));
+        var method = ((args[1] && args[1].method) ||
+                     (args[0] instanceof Request ? args[0].method : 'GET')).toUpperCase();
+        var res = await _fetch.apply(this, args);
+        if (method === 'POST' && url.indexOf(TARGET) !== -1) {
+            try {
+                var body = await res.clone().text();
+                window.__capturedData = { url: url, body: body, links: extractLinks(body) };
+            } catch(e) {}
+        }
+        return res;
+    };
+
+    var _open = XMLHttpRequest.prototype.open;
+    var _send = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(m, u) {
+        this._m = m;
+        this._u = u;
+        return _open.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function(b) {
+        var self = this;
+        if (this._m && this._m.toUpperCase() === 'POST' &&
+            this._u && this._u.indexOf(TARGET) !== -1) {
+            this.addEventListener('loadend', function() {
+                if (self.status >= 200 && self.status < 300) {
+                    try {
+                        window.__capturedData = {
+                            url: self._u,
+                            body: self.responseText,
+                            links: extractLinks(self.responseText)
+                        };
+                    } catch(e) {}
+                }
+            }, { once: true });
+        }
+        return _send.apply(this, arguments);
+    };
+})();
+"""
 
 
 def build_url(data):
@@ -149,12 +169,12 @@ def playwright_get_url(cookie, method):
                     clicked = page.evaluate(
                         """(txt) => {
                             var els = document.querySelectorAll('button, a, div, span');
-                            for (var i=0; i<els.length; i++) {
+                            for (var i = 0; i < els.length; i++) {
                                 if (els[i].textContent.trim() === txt) {
                                     els[i].click(); return true;
                                 }
                             }
-                            for (var i=0; i<els.length; i++) {
+                            for (var i = 0; i < els.length; i++) {
                                 if (els[i].textContent.trim().toLowerCase().indexOf(txt.toLowerCase()) !== -1) {
                                     els[i].click(); return true;
                                 }
@@ -258,9 +278,13 @@ async def show_welcome(update, context):
         "Нажимая кнопку ниже, вы принимаете условия использования."
     )
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+        await update.callback_query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=kb
+        )
     else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        await update.message.reply_text(
+            text, parse_mode="Markdown", reply_markup=kb
+        )
 
 
 async def show_main_menu(update, context):
@@ -273,9 +297,13 @@ async def show_main_menu(update, context):
         "Выберите действие ниже:"
     )
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
+        await update.callback_query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=main_menu_kb()
+        )
     else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
+        await update.message.reply_text(
+            text, parse_mode="Markdown", reply_markup=main_menu_kb()
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,7 +327,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_MENU
 
     if data == "help":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Назад", callback_data="main_menu")]
+        ])
         await query.edit_message_text(
             "*Помощь*\n\n"
             "*Как пользоваться:*\n"
@@ -349,7 +379,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not invoice:
             await query.edit_message_text(
                 "Ошибка создания инвойса. Попробуй позже.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="buy")]])
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Назад", callback_data="buy")]
+                ])
             )
             return WAITING_MENU
 
@@ -388,12 +420,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Зачислено попыток: *" + str(cnt) + "*\n"
                     "Всего попыток: *" + str(user_attempts[user_id]) + "*",
                     parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В меню", callback_data="main_menu")]])
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("В меню", callback_data="main_menu")]
+                    ])
                 )
             else:
                 await query.answer("Оплата уже обработана!", show_alert=True)
         else:
-            await query.answer("Оплата не найдена. Подожди и попробуй снова.", show_alert=True)
+            await query.answer(
+                "Оплата не найдена. Подожди и попробуй снова.",
+                show_alert=True
+            )
         return WAITING_MENU
 
     if data == "get_link":
@@ -468,7 +505,9 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = s.get("https://users.roblox.com/v1/users/authenticated")
 
     if r.status_code != 200:
-        await msg.edit_text("Неверный cookie - попытка возвращена!\n\n/start чтобы попробовать снова")
+        await msg.edit_text(
+            "Неверный cookie - попытка возвращена!\n\n/start чтобы попробовать снова"
+        )
         return ConversationHandler.END
 
     user = r.json()
@@ -488,16 +527,25 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if isinstance(result, str) and result.startswith("ERROR"):
         user_attempts[user_id] += 1
-        await msg.edit_text("Техническая ошибка - попытка возвращена!\n\n/start чтобы попробовать снова")
+        await msg.edit_text(
+            "Техническая ошибка - попытка возвращена!\n\n/start чтобы попробовать снова"
+        )
     elif result == "NOT_CLICKED":
         user_attempts[user_id] += 1
-        await msg.edit_text("Кнопка не найдена - попытка возвращена!\n\n/start чтобы попробовать снова")
+        await msg.edit_text(
+            "Кнопка не найдена - попытка возвращена!\n\n/start чтобы попробовать снова"
+        )
     elif result and "withpersona.com" in result:
-        await msg.edit_text("*Ссылка получена!*\n\nИспользуй сразу - одноразовая!", parse_mode="Markdown")
+        await msg.edit_text(
+            "*Ссылка получена!*\n\nИспользуй сразу - одноразовая!",
+            parse_mode="Markdown"
+        )
         await update.message.reply_text(result)
     else:
         user_attempts[user_id] += 1
-        await msg.edit_text("Не удалось получить ссылку - попытка возвращена!\n\n/start чтобы попробовать снова")
+        await msg.edit_text(
+            "Не удалось получить ссылку - попытка возвращена!\n\n/start чтобы попробовать снова"
+        )
 
     attempts_left = user_attempts.get(user_id, 0)
     await update.message.reply_text(
@@ -525,7 +573,23 @@ def main():
             WAITING_MENU: [CallbackQueryHandler(handle_callback)],
             WAITING_COOKIE: [
                 CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_cookie),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_cookie
+                ),
             ],
             WAITING_BUY: [CallbackQueryHandler(handle_callback)],
-            WAITING
+            WAITING_PAYMENT: [CallbackQueryHandler(handle_callback)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
+        per_chat=True,
+        block=False,
+    )
+    app.add_handler(conv)
+    print("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
