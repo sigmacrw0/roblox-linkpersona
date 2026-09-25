@@ -22,6 +22,8 @@ executor = ThreadPoolExecutor(max_workers=20)
 accepted_users = set()
 user_attempts = {}
 pending_payments = {}
+user_spent = {}
+user_names = {}
 
 WAITING_RULES = 0
 WAITING_MENU = 1
@@ -252,7 +254,9 @@ def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Получить ссылку", callback_data="get_link")],
         [InlineKeyboardButton("Купить попытки", callback_data="buy")],
-        [InlineKeyboardButton("Помощь", callback_data="help")],
+        [InlineKeyboardButton("Топ пользователей", callback_data="top")],
+        [InlineKeyboardButton("Помощь", callback_data="help"),
+         InlineKeyboardButton("Саппорт", url="https://t.me/dedbed12")],
     ])
 
 
@@ -324,6 +328,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "main_menu":
         await show_main_menu(update, context)
+        return WAITING_MENU
+
+    if data == "top":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Назад", callback_data="main_menu")]
+        ])
+        sorted_users = sorted(user_spent.items(), key=lambda x: x[1], reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        lines = ["*Топ пользователей*\n"]
+        if not sorted_users:
+            lines.append("Пока никто не совершил покупок.")
+        else:
+            for i, (uid, spent) in enumerate(sorted_users[:10]):
+                name = user_names.get(uid, "Аноним")
+                medal = medals[i] if i < 3 else str(i + 1) + "."
+                lines.append(medal + " " + str(i + 1 if i >= 3 else "") + " " + name + " · $" + str(round(spent, 2)))
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return WAITING_MENU
 
     if data == "help":
@@ -414,7 +439,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payment = pending_payments.pop(invoice_id, None)
             if payment:
                 cnt = payment["attempts"]
+                spent = round(cnt * PRICE, 2)
                 user_attempts[user_id] = user_attempts.get(user_id, 0) + cnt
+                user_spent[user_id] = round(user_spent.get(user_id, 0) + spent, 2)
+                tg_user = update.effective_user
+                user_names[user_id] = tg_user.username or tg_user.first_name or "Аноним"
                 await query.edit_message_text(
                     "*Оплата подтверждена!*\n\n"
                     "Зачислено попыток: *" + str(cnt) + "*\n"
