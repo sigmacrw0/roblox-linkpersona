@@ -395,7 +395,7 @@ async def show_main_menu(update, context):
     kb = main_menu_kb()
     # Для админов добавляем кнопку
     if user_id in ADMIN_IDS:
-        buttons = kb.inline_keyboard[:]
+        buttons = list(list(row) for row in kb.inline_keyboard)
         buttons.append([InlineKeyboardButton("Админ панель", callback_data="admin")])
         kb = InlineKeyboardMarkup(buttons)
     if update.callback_query:
