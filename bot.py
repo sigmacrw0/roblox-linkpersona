@@ -802,20 +802,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_ADMIN
 
-    if data.startswith("create_promo_"):
-        if user_id not in ADMIN_IDS:
-            return WAITING_MENU
-        attempts_count = int(data.split("_")[2])
-        context.user_data["promo_attempts"] = attempts_count
-        await query.edit_message_text(
-            "*Создать промокод на " + str(attempts_count) + " попыток*\n\nФормат: КОД:МАКС_ИСПОЛЬЗОВАНИЙ\nПример: SUMMER2024:10\nИли просто: SUMMER2024 (1 использование)",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
-        )
-        context.user_data["waiting"] = "create_promo"
-        return WAITING_ADMIN_CREATE_PROMO
 
     if data == "top":
         kb = InlineKeyboardMarkup([
@@ -1119,32 +1105,30 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_ADMIN
 
     # Создание промокода
-    if waiting == "create_promo":
+    if waiting == "create_promo_step1":
         if user_id not in ADMIN_IDS:
             await update.message.reply_text("Нет доступа!")
             return WAITING_MENU
         context.user_data["waiting"] = None
-        attempts_count = context.user_data.get("promo_attempts", 1)
-        raw = text.strip()
-        if raw.lower() == "авто":
-            new_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
-            max_uses = 1
-        elif ":" in raw:
-            parts = raw.upper().split(":", 1)
-            new_code = parts[0].strip()
-            try:
-                max_uses = int(parts[1].strip())
-            except Exception:
-                max_uses = 1
-        else:
-            new_code = raw.upper().strip()
-            max_uses = 1
-
-        if not new_code:
-            await update.message.reply_text("Пустой промокод! Попробуй снова.")
-            context.user_data["waiting"] = "create_promo"
+        parts = text.strip().split()
+        if len(parts) < 1:
+            await update.message.reply_text(
+                "Неверный формат! Пример: `SUMMER 5 10`",
+                parse_mode="Markdown"
+            )
+            context.user_data["waiting"] = "create_promo_step1"
             return WAITING_ADMIN_CREATE_PROMO
-
+        new_code = parts[0].upper()
+        try:
+            attempts_count = int(parts[1]) if len(parts) > 1 else 1
+        except Exception:
+            attempts_count = 1
+        try:
+            max_uses = int(parts[2]) if len(parts) > 2 else 1
+        except Exception:
+            max_uses = 1
+        attempts_count = max(1, min(attempts_count, 1000))
+        max_uses = max(1, min(max_uses, 10000))
         promo_codes[new_code] = {
             "attempts": attempts_count,
             "uses": 0,
@@ -1230,7 +1214,10 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cookie = context.user_data.get("email_cookie", "")
         username = context.user_data.get("email_username", "")
         msg = await update.message.reply_text("Привязываю почту...")
-        success, response = link_email_playwright(cookie, email_addr)
+        loop2 = asyncio.get_event_loop()
+        success, response = await loop2.run_in_executor(
+            executor, link_email_playwright, cookie, email_addr
+        )
         if success:
             await msg.edit_text(
                 "*Почта успешно привязана!*\n\n"
