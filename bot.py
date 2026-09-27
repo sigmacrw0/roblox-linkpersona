@@ -131,31 +131,74 @@ INJECT_SCRIPT = r"""
 """
 
 
-def make_roblox_session(cookie):
-    """Создаём сессию с CSRF токеном"""
-    s = requests.Session()
-    s.cookies[".ROBLOSECURITY"] = cookie
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://www.roblox.com",
-        "Referer": "https://www.roblox.com/"
-    })
-    # Получаем CSRF из той же сессии
-    try:
-        r = s.post("https://auth.roblox.com/v2/logout")
-        csrf = r.headers.get("x-csrf-token", "")
-        if csrf:
-            s.headers["x-csrf-token"] = csrf
-    except Exception:
-        pass
-    return s
+# Кнопки Add/Update email на всех языках Roblox
+EMAIL_ADD_TEXTS = [
+    # English
+    "Add", "Add Email", "Add email address",
+    # Spanish
+    "Agregar", "Anadir", "Agregar correo",
+    # Portuguese
+    "Adicionar", "Adicionar email",
+    # French
+    "Ajouter", "Ajouter un email",
+    # German
+    "Hinzufugen", "E-Mail hinzufugen",
+    # Italian
+    "Aggiungi", "Aggiungi email",
+    # Russian
+    "Добавить", "Добавить почту",
+    # Dutch
+    "Toevoegen", "E-mail toevoegen",
+    # Polish
+    "Dodaj", "Dodaj email",
+    # Turkish
+    "Ekle", "E-posta ekle",
+    # Indonesian
+    "Tambah", "Tambahkan email",
+    # Japanese
+    "追加", "メールを追加",
+    # Korean
+    "추가", "이메일 추가",
+    # Chinese
+    "添加", "添加邮箱",
+]
+
+EMAIL_UPDATE_TEXTS = [
+    # English
+    "Update", "Update Email", "Change Email", "Edit Email", "Change",
+    # Spanish
+    "Actualizar", "Cambiar", "Editar correo",
+    # Portuguese
+    "Atualizar", "Alterar", "Mudar email",
+    # French
+    "Mettre a jour", "Modifier", "Changer email",
+    # German
+    "Aktualisieren", "Andern", "E-Mail andern",
+    # Italian
+    "Aggiorna", "Modifica", "Cambia email",
+    # Russian
+    "Обновить", "Изменить", "Изменить почту",
+    # Dutch
+    "Bijwerken", "Wijzigen", "Email wijzigen",
+    # Polish
+    "Aktualizuj", "Zmien", "Zmien email",
+    # Turkish
+    "Guncelle", "Degistir", "E-posta degistir",
+    # Indonesian
+    "Perbarui", "Ubah", "Ubah email",
+    # Japanese
+    "更新", "変更", "メールを変更",
+    # Korean
+    "업데이트", "변경", "이메일 변경",
+    # Chinese
+    "更新", "修改", "修改邮箱",
+]
 
 def check_email_status(cookie):
-    """Проверяем привязана ли почта"""
+    """Проверяем привязана ли почта через API"""
     try:
-        s = make_roblox_session(cookie)
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
         r = s.get("https://accountinformation.roblox.com/v1/email")
         if r.status_code == 200:
             data = r.json()
@@ -166,25 +209,104 @@ def check_email_status(cookie):
     except Exception:
         return None, None
 
-def link_email(cookie, email_addr):
-    """Привязываем почту к аккаунту"""
+def link_email_playwright(cookie, email_addr):
+    """Привязываем почту через браузер — надёжнее API"""
     try:
-        s = make_roblox_session(cookie)
-        r = s.post(
-            "https://accountinformation.roblox.com/v1/email",
-            json={"emailAddress": email_addr}
-        )
-        if r.status_code == 200:
-            return True, "OK"
-        # Пробуем альтернативный endpoint
-        r2 = s.patch(
-            "https://accountinformation.roblox.com/v1/email",
-            json={"emailAddress": email_addr}
-        )
-        if r2.status_code == 200:
-            return True, "OK"
-        return False, r.text + " | " + r2.text
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            ctx.add_cookies([{
+                "name": ".ROBLOSECURITY",
+                "value": cookie,
+                "domain": ".roblox.com",
+                "path": "/"
+            }])
+            page = ctx.new_page()
+            page.goto(
+                "https://www.roblox.com/my/account#!/info",
+                wait_until="networkidle",
+                timeout=30000
+            )
+            page.wait_for_timeout(3000)
+
+            # Шаг 1: Нажимаем Add или Update
+            all_email_btn_texts = EMAIL_ADD_TEXTS + EMAIL_UPDATE_TEXTS
+            clicked = click_any_text(page, all_email_btn_texts)
+            if not clicked:
+                browser.close()
+                return False, "Кнопка Add/Update не найдена"
+
+            logging.info("Email кнопка нажата: " + str(clicked))
+            page.wait_for_timeout(2000)
+
+            # Шаг 2: Вводим email в поле ввода
+            input_selectors = [
+                "input[type='email']",
+                "input[placeholder*='email' i]",
+                "input[placeholder*='mail' i]",
+                "input[name='email' i]",
+                "input[type='text']",
+            ]
+            input_found = False
+            for sel in input_selectors:
+                try:
+                    el = page.wait_for_selector(sel, timeout=3000)
+                    if el:
+                        el.clear()
+                        el.type(email_addr, delay=50)
+                        input_found = True
+                        logging.info("Email введён в поле: " + sel)
+                        break
+                except Exception:
+                    continue
+
+            if not input_found:
+                browser.close()
+                return False, "Поле для email не найдено"
+
+            page.wait_for_timeout(1000)
+
+            # Шаг 3: Нажимаем Save / Submit
+            save_texts = [
+                "Save", "Submit", "Confirm", "OK", "Apply",
+                "Guardar", "Enviar", "Confirmar",
+                "Sauvegarder", "Soumettre", "Confirmer",
+                "Speichern", "Bestatigen",
+                "Salva", "Invia", "Conferma",
+                "Сохранить", "Подтвердить", "Отправить",
+                "Opslaan", "Bevestigen",
+                "Zapisz", "Zatwierdz",
+                "Kaydet", "Onayla",
+                "Simpan", "Kirim",
+                "保存", "确认", "提交",
+                "保存する", "確認",
+                "저장", "확인",
+            ]
+            saved = click_any_text(page, save_texts)
+            if saved:
+                logging.info("Save нажата: " + str(saved))
+            else:
+                # Пробуем нажать Enter
+                page.keyboard.press("Enter")
+                logging.info("Нажат Enter для отправки")
+
+            page.wait_for_timeout(3000)
+
+            # Шаг 4: Проверяем успех
+            email_now, _ = check_email_status(cookie)
+            browser.close()
+
+            if email_now and email_addr.lower() in email_now.lower():
+                return True, "OK"
+            elif email_now:
+                return True, "Почта может быть обновлена: " + email_now
+            return False, "Не удалось подтвердить привязку"
+
     except Exception as e:
+        logging.error("Email Playwright error: %s", e)
         return False, str(e)
 
 
@@ -257,9 +379,70 @@ CONTINUE_TEXTS = [
 ]
 
 RESET_TEXTS = [
-    "Reset", "Restablecer", "Reinitialiser", "Zurucksetzen",
-    "Reimposta", "Сбросить", "Opnieuw", "Zresetuj",
-    "Sifirla", "Atur ulang",
+    # English
+    "Reset", "Start over", "Try again", "Restart",
+    # Spanish
+    "Restablecer", "Volver a intentar", "Reiniciar",
+    # Portuguese
+    "Redefinir", "Tentar novamente", "Recomecar",
+    # French
+    "Reinitialiser", "Recommencer", "Reessayer",
+    # German
+    "Zurucksetzen", "Neu starten", "Erneut versuchen",
+    # Italian
+    "Reimposta", "Ricomincia", "Riprova",
+    # Russian
+    "Сбросить", "Начать заново", "Попробовать снова",
+    # Dutch
+    "Opnieuw", "Opnieuw instellen", "Opnieuw proberen",
+    # Polish
+    "Zresetuj", "Zacznij od nowa", "Sprobuj ponownie",
+    # Turkish
+    "Sifirla", "Yeniden baslat", "Tekrar dene",
+    # Indonesian
+    "Atur ulang", "Mulai ulang", "Coba lagi",
+    # Japanese
+    "リセット", "やり直す",
+    # Korean
+    "재설정", "다시 시도",
+    # Chinese
+    "重置", "重新开始",
+]
+
+# Все тексты Continue на всех языках Roblox
+CONTINUE_TEXTS = [
+    # English
+    "Continue", "Next", "Proceed", "Go",
+    # Spanish
+    "Continuar", "Siguiente", "Proceder",
+    # Portuguese
+    "Continuar", "Proximo", "Prosseguir",
+    # French
+    "Continuer", "Suivant", "Proceder",
+    # German
+    "Weiter", "Fortfahren", "Naechste",
+    # Italian
+    "Continua", "Avanti", "Procedere",
+    # Russian
+    "Продолжить", "Далее", "Вперёд",
+    # Dutch
+    "Doorgaan", "Volgende", "Verder",
+    # Polish
+    "Kontynuuj", "Dalej", "Nastepny",
+    # Turkish
+    "Devam et", "Ileri", "Sonraki",
+    # Indonesian
+    "Lanjutkan", "Berikutnya", "Teruskan",
+    # Vietnamese
+    "Tiep tuc", "Tiep theo",
+    # Filipino
+    "Magpatuloy", "Susunod",
+    # Japanese
+    "続ける", "次へ",
+    # Korean
+    "계속", "다음",
+    # Chinese
+    "继续", "下一步",
 ]
 
 
@@ -313,33 +496,51 @@ def playwright_get_url(cookie, method):
             )
             page.wait_for_timeout(3000)
 
-            # Выбираем список текстов кнопок по методу
             target_texts = CAMERA_TEXTS if method == "camera" else ID_TEXTS
 
-            # Шаг 1: Нажимаем основную кнопку (Continue with camera / ID)
+            # Шаг 1: Проверяем есть ли кнопка Reset
+            # Если есть — нажимаем сначала её
+            reset_clicked = click_any_text(page, RESET_TEXTS)
+            if reset_clicked:
+                logging.info("Нажата Reset: " + str(reset_clicked))
+                page.wait_for_timeout(3000)
+                # После Reset ждём загрузки страницы
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
+
+            # Шаг 2: Нажимаем основную кнопку — 5 попыток
             clicked = False
-            for _ in range(3):
+            for attempt in range(5):
                 result = click_any_text(page, target_texts)
                 if result:
                     logging.info("Нажата кнопка: " + str(result))
                     clicked = True
                     break
                 page.wait_for_timeout(2000)
+                # Каждые 2 попытки проверяем Reset снова
+                if attempt % 2 == 1:
+                    r = click_any_text(page, RESET_TEXTS)
+                    if r:
+                        logging.info("Reset повторно: " + str(r))
+                        page.wait_for_timeout(2000)
 
             if not clicked:
                 browser.close()
                 return "NOT_CLICKED"
 
-            # Шаг 2: Ждём и нажимаем Continue если появилась
+            # Шаг 3: Нажимаем Continue если появилась
             page.wait_for_timeout(2000)
             cont = click_any_text(page, CONTINUE_TEXTS)
             if cont:
-                logging.info("Нажата кнопка Continue: " + str(cont))
+                logging.info("Continue: " + str(cont))
                 page.wait_for_timeout(1500)
 
-            # Шаг 3: Ждём ссылку 25 секунд
+            # Шаг 4: Ждём ссылку 30 секунд
             result_url = None
-            for i in range(25):
+            for i in range(30):
                 page.wait_for_timeout(1000)
                 try:
                     raw = page.evaluate("() => window.__capturedData")
@@ -351,11 +552,11 @@ def playwright_get_url(cookie, method):
                 except Exception:
                     pass
 
-                # Если появилась кнопка Continue — нажимаем
+                # Каждые 3 сек нажимаем Continue если появилась
                 if i % 3 == 0:
                     c = click_any_text(page, CONTINUE_TEXTS)
                     if c:
-                        logging.info("Нажата Continue на шаге " + str(i))
+                        logging.info("Continue на шаге " + str(i))
 
             browser.close()
             return result_url
@@ -1029,7 +1230,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cookie = context.user_data.get("email_cookie", "")
         username = context.user_data.get("email_username", "")
         msg = await update.message.reply_text("Привязываю почту...")
-        success, response = link_email(cookie, email_addr)
+        success, response = link_email_playwright(cookie, email_addr)
         if success:
             await msg.edit_text(
                 "*Почта успешно привязана!*\n\n"
@@ -1048,7 +1249,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "- Email уже используется другим аккаунтом\n"
                 "- Неверный формат email\n"
                 "- Проблема с сессией\n\n"
-                "Ответ сервера: `" + str(response)[:100] + "`",
+                "Причина: `" + str(response)[:150] + "`",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Попробовать снова", callback_data="link_email")],
@@ -1218,7 +1419,6 @@ def main():
         ],
         per_user=True,
         per_chat=True,
-        block=False,
     )
     app.add_handler(conv)
     print("Bot started!")
