@@ -210,6 +210,135 @@ def check_email_status(cookie):
         return None, None
 
 def link_email_playwright(cookie, email_addr):
+    """Привязываем почту через браузер"""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            ctx.add_cookies([{
+                "name": ".ROBLOSECURITY",
+                "value": cookie,
+                "domain": ".roblox.com",
+                "path": "/"
+            }])
+            page = ctx.new_page()
+            page.goto(
+                "https://www.roblox.com/my/account#!/info",
+                wait_until="networkidle",
+                timeout=30000
+            )
+            page.wait_for_timeout(3000)
+
+            # Нажимаем Add или Update
+            all_btn = EMAIL_ADD_TEXTS + EMAIL_UPDATE_TEXTS
+            clicked = click_any_text(page, all_btn)
+            if not clicked:
+                browser.close()
+                return False, "Кнопка Add/Update не найдена на странице"
+
+            logging.info("Email кнопка: " + str(clicked))
+            # Ждём появления модального окна
+            page.wait_for_timeout(3000)
+
+            # Ищем поле ввода email — расширенный список селекторов
+            input_found = False
+            selectors = [
+                "input[type='email']",
+                "input[name='emailAddress']",
+                "input[name='email']",
+                "input[placeholder*='email' i]",
+                "input[placeholder*='Email' i]",
+                "input[placeholder*='@']",
+                ".email-input input",
+                "[data-testid*='email'] input",
+                "[class*='email'] input",
+                "input[type='text']",
+                "input:visible",
+            ]
+
+            for sel in selectors:
+                try:
+                    page.wait_for_selector(sel, timeout=3000, state="visible")
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.triple_click()
+                        el.fill(email_addr)
+                        logging.info("Email введён в: " + sel)
+                        input_found = True
+                        break
+                except Exception:
+                    continue
+
+            if not input_found:
+                # Последняя попытка через JavaScript
+                try:
+                    filled = page.evaluate("""(email) => {
+                        var inputs = document.querySelectorAll('input');
+                        for (var i = 0; i < inputs.length; i++) {
+                            var inp = inputs[i];
+                            if (inp.type === 'email' || inp.type === 'text') {
+                                inp.value = email;
+                                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                                inp.dispatchEvent(new Event('change', {bubbles: true}));
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""", email_addr)
+                    if filled:
+                        input_found = True
+                        logging.info("Email введён через JS")
+                except Exception:
+                    pass
+
+            if not input_found:
+                browser.close()
+                return False, "Поле email не найдено. Попробуй ещё раз"
+
+            page.wait_for_timeout(1000)
+
+            # Нажимаем Save
+            save_texts = [
+                "Save", "Submit", "Confirm", "Update", "Apply", "OK",
+                "Guardar", "Sauvegarder", "Speichern", "Salva",
+                "Сохранить", "Подтвердить", "Opslaan", "Zapisz",
+                "Kaydet", "Simpan", "保存", "保存する", "저장",
+            ]
+            saved = click_any_text(page, save_texts)
+            if saved:
+                logging.info("Save: " + str(saved))
+            else:
+                page.keyboard.press("Enter")
+                logging.info("Enter нажат")
+
+            page.wait_for_timeout(3000)
+            browser.close()
+            return True, "OK"
+
+    except Exception as e:
+        logging.error("Email error: %s", e)
+        return False, str(e)
+
+
+def check_email_status(cookie):
+    """Проверяем привязана ли почта через API"""
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        r = s.get("https://accountinformation.roblox.com/v1/email")
+        if r.status_code == 200:
+            data = r.json()
+            email = data.get("emailAddress", "")
+            verified = data.get("verified", False)
+            return email, verified
+        return None, None
+    except Exception:
+        return None, None
+
+def link_email_playwright(cookie, email_addr):
     """Привязываем почту через браузер — надёжнее API"""
     try:
         with sync_playwright() as p:
@@ -765,18 +894,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_promo":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("1 попытка", callback_data="create_promo_1")],
-            [InlineKeyboardButton("5 попыток", callback_data="create_promo_5")],
-            [InlineKeyboardButton("10 попыток", callback_data="create_promo_10")],
-            [InlineKeyboardButton("15 попыток", callback_data="create_promo_15")],
-            [InlineKeyboardButton("25 попыток", callback_data="create_promo_25")],
-            [InlineKeyboardButton("Отмена", callback_data="admin")],
-        ])
+        context.user_data["waiting"] = "create_promo_step1"
+        context.user_data["promo_attempts"] = 0
         await query.edit_message_text(
-            "*Создать промокод*\n\nВыберите количество попыток:",
+            "*Создать промокод*" + chr(10) + chr(10) +
+            "Напишите в формате:" + chr(10) +
+            "`КОД ПОПЫТКИ ИСПОЛЬЗОВАНИЙ`" + chr(10) + chr(10) +
+            "Примеры:" + chr(10) +
+            "`SUMMER 5 10` - 5 попыток, 10 раз" + chr(10) +
+            "`VIP 25 1` - 25 попыток, 1 раз" + chr(10) +
+            "`FREE 1 100` - 1 попытка, 100 раз",
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="admin")]
+            ])
         )
         return WAITING_ADMIN_CREATE_PROMO
 
