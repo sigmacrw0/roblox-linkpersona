@@ -159,6 +159,44 @@ def click_any_text(page, texts):
         return None
 
 
+CAMERA_TEXTS = [
+    "Continue with camera", "Continue with Camera",
+    "Continuar con la camara", "Continuar com camera",
+    "Continuer avec la camera", "Mit Kamera fortfahren",
+    "Continua con la fotocamera", "Продолжить с камерой",
+    "Doorgaan met camera", "Kontynuuj z kamera",
+    "Kamerayla devam et", "Lanjutkan dengan kamera",
+    "camera", "Camera",
+]
+
+ID_TEXTS = [
+    "Continue with ID", "Continue with Id",
+    "Continuar con ID", "Continuar com ID",
+    "Continuer avec ID", "Mit Ausweis fortfahren",
+    "Continua con ID", "Продолжить с удостоверением",
+    "Doorgaan met ID", "Kontynuuj z dowodem",
+    "Kimlikle devam et", "Lanjutkan dengan ID",
+    "Government ID", "ID document", "ID",
+]
+
+RESET_TEXTS = [
+    "Reset", "Start over", "Try again", "Restart",
+    "Restablecer", "Reiniciar", "Redefinir",
+    "Reinitialiser", "Recommencer", "Zurucksetzen",
+    "Reimposta", "Ricomincia", "Сбросить", "Начать заново",
+    "Opnieuw", "Zresetuj", "Sifirla", "Atur ulang",
+    "重置", "リセット", "재설정",
+]
+
+CONTINUE_TEXTS = [
+    "Continue", "Next", "Proceed",
+    "Continuar", "Suivant", "Weiter",
+    "Continua", "Продолжить", "Далее",
+    "Doorgaan", "Kontynuuj", "Devam et",
+    "Lanjutkan", "继续", "続ける", "계속",
+]
+
+
 def playwright_get_url(cookie, method):
     try:
         with sync_playwright() as p:
