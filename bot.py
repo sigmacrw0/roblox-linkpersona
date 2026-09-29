@@ -39,8 +39,6 @@ WAITING_ADMIN_BROADCAST = 7
 WAITING_ADMIN_ADD_BALANCE = 8
 WAITING_ADMIN_ADD_BALANCE_AMOUNT = 9
 WAITING_ADMIN_CREATE_PROMO = 10
-WAITING_EMAIL_COOKIE = 11
-WAITING_EMAIL_INPUT = 12
 
 PRICE = 0.20
 DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
@@ -131,167 +129,7 @@ INJECT_SCRIPT = r"""
 """
 
 
-# Кнопки Add/Update email на всех языках Roblox
-EMAIL_ADD_TEXTS = [
-    # English
-    "Add", "Add Email", "Add email address",
-    # Spanish
-    "Agregar", "Anadir", "Agregar correo",
-    # Portuguese
-    "Adicionar", "Adicionar email",
-    # French
-    "Ajouter", "Ajouter un email",
-    # German
-    "Hinzufugen", "E-Mail hinzufugen",
-    # Italian
-    "Aggiungi", "Aggiungi email",
-    # Russian
-    "Добавить", "Добавить почту",
-    # Dutch
-    "Toevoegen", "E-mail toevoegen",
-    # Polish
-    "Dodaj", "Dodaj email",
-    # Turkish
-    "Ekle", "E-posta ekle",
-    # Indonesian
-    "Tambah", "Tambahkan email",
-    # Japanese
-    "追加", "メールを追加",
-    # Korean
-    "추가", "이메일 추가",
-    # Chinese
-    "添加", "添加邮箱",
-]
 
-EMAIL_UPDATE_TEXTS = [
-    # English
-    "Update", "Update Email", "Change Email", "Edit Email", "Change",
-    # Spanish
-    "Actualizar", "Cambiar", "Editar correo",
-    # Portuguese
-    "Atualizar", "Alterar", "Mudar email",
-    # French
-    "Mettre a jour", "Modifier", "Changer email",
-    # German
-    "Aktualisieren", "Andern", "E-Mail andern",
-    # Italian
-    "Aggiorna", "Modifica", "Cambia email",
-    # Russian
-    "Обновить", "Изменить", "Изменить почту",
-    # Dutch
-    "Bijwerken", "Wijzigen", "Email wijzigen",
-    # Polish
-    "Aktualizuj", "Zmien", "Zmien email",
-    # Turkish
-    "Guncelle", "Degistir", "E-posta degistir",
-    # Indonesian
-    "Perbarui", "Ubah", "Ubah email",
-    # Japanese
-    "更新", "変更", "メールを変更",
-    # Korean
-    "업데이트", "변경", "이메일 변경",
-    # Chinese
-    "更新", "修改", "修改邮箱",
-]
-
-def check_email_status(cookie):
-    """Проверяем привязана ли почта"""
-    try:
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        r = s.get("https://accountinformation.roblox.com/v1/email")
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("emailAddress", ""), data.get("verified", False)
-        return None, None
-    except Exception:
-        return None, None
-
-
-def link_email_playwright(cookie, email_addr):
-    """Привязываем почту через API с правильным CSRF"""
-    try:
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json;charset=UTF-8",
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account#!/info",
-            "X-Requested-With": "XMLHttpRequest",
-        })
-
-        # Шаг 1: Первый запрос без CSRF — получаем токен из ответа 403
-        r1 = s.post(
-            "https://accountinformation.roblox.com/v1/email",
-            json={"emailAddress": email_addr}
-        )
-        logging.info("Email API step1: %d %s", r1.status_code, r1.text[:100])
-
-        if r1.status_code == 200:
-            return True, "OK"
-
-        # Берём CSRF из ответа 403
-        csrf = (r1.headers.get("x-csrf-token") or
-                r1.headers.get("X-CSRF-Token") or
-                r1.headers.get("X-Csrf-Token"))
-
-        if not csrf:
-            # Запасной вариант — logout endpoint
-            r0 = s.post("https://auth.roblox.com/v2/logout")
-            csrf = r0.headers.get("x-csrf-token")
-            logging.info("CSRF from logout: %s", csrf)
-
-        if not csrf:
-            return False, "Не удалось получить CSRF токен"
-
-        s.headers["x-csrf-token"] = csrf
-
-        # Шаг 2: Повторяем запрос с CSRF токеном
-        r2 = s.post(
-            "https://accountinformation.roblox.com/v1/email",
-            json={"emailAddress": email_addr}
-        )
-        logging.info("Email API step2: %d %s", r2.status_code, r2.text[:100])
-
-        if r2.status_code == 200:
-            return True, "OK"
-
-        # Пробуем PATCH если POST не работает
-        r3 = s.patch(
-            "https://accountinformation.roblox.com/v1/email",
-            json={"emailAddress": email_addr}
-        )
-        logging.info("Email API patch: %d %s", r3.status_code, r3.text[:100])
-
-        if r3.status_code == 200:
-            return True, "OK"
-
-        # Возвращаем понятную ошибку
-        resp_text = r2.text
-        try:
-            err = r2.json()
-            errors = err.get("errors", [])
-            if errors:
-                msg = errors[0].get("message", "")
-                code_err = errors[0].get("code", 0)
-                if code_err == 2:
-                    return False, "Email уже привязан к другому аккаунту"
-                elif code_err == 4:
-                    return False, "Неверный формат email"
-                elif code_err == 11:
-                    return False, "Аккаунт слишком молод для привязки email"
-                elif msg:
-                    return False, msg
-        except Exception:
-            pass
-        return False, "Ошибка сервера: " + resp_text[:100]
-
-    except Exception as e:
-        logging.error("Email error: %s", e)
-        return False, str(e)
 
 
 def click_any_text(page, texts):
@@ -452,7 +290,6 @@ def check_invoice(invoice_id):
 def main_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Получить ссылку", callback_data="get_link")],
-        [InlineKeyboardButton("Привязать почту", callback_data="link_email")],
         [InlineKeyboardButton("Купить попытки", callback_data="buy"),
          InlineKeyboardButton("Промокод", callback_data="promo")],
         [InlineKeyboardButton("Топ пользователей", callback_data="top")],
@@ -540,20 +377,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "main_menu":
         await show_main_menu(update, context)
         return WAITING_MENU
-
-    if data == "link_email":
-        await query.edit_message_text(
-            "*Привязка почты к Roblox*\n\n"
-            "Отправь свой `.ROBLOSECURITY` cookie\n\n"
-            "Бот проверит привязана ли почта и если нет - привяжет.\n\n"
-            "Сообщение будет удалено автоматически",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад", callback_data="main_menu")]
-            ])
-        )
-        context.user_data["waiting"] = "email_cookie"
-        return WAITING_EMAIL_COOKIE
 
     if data == "promo":
         await query.edit_message_text(
@@ -1000,101 +823,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_ADMIN
 
     # Обработка cookie для email
-    if waiting == "email_cookie":
-        context.user_data["waiting"] = None
-        cookie = text
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-        msg = await update.message.reply_text("Проверяю аккаунт...")
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        r = s.get("https://users.roblox.com/v1/users/authenticated")
-        if r.status_code != 200:
-            await msg.edit_text(
-                "Неверный cookie!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
-                ])
-            )
-            return WAITING_MENU
-        user = r.json()
-        email, verified = check_email_status(cookie)
-        if email:
-            await msg.edit_text(
-                "*Аккаунт: " + user["name"] + "*\n\n"
-                "Почта уже привязана: `" + email + "`\n"
-                "Статус: " + ("Подтверждена" if verified else "Не подтверждена"),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
-                ])
-            )
-            return WAITING_MENU
-        # Почта не привязана — просим ввести
-        context.user_data["email_cookie"] = cookie
-        context.user_data["email_username"] = user["name"]
-        context.user_data["waiting"] = "email_input"
-        await msg.edit_text(
-            "*Аккаунт: " + user["name"] + "*\n\n"
-            "Почта не привязана.\n\n"
-            "Введите email для привязки:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="main_menu")]
-            ])
-        )
-        return WAITING_EMAIL_INPUT
-
     # Обработка ввода email
-    if waiting == "email_input":
-        context.user_data["waiting"] = None
-        import re as _re
-        email_addr = text.strip()
-        if not _re.match("[^@]+@[^@]+[.][^@]+", email_addr):
-            await update.message.reply_text(
-                "Неверный формат email! Попробуй снова.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Отмена", callback_data="main_menu")]
-                ])
-            )
-            context.user_data["waiting"] = "email_input"
-            return WAITING_EMAIL_INPUT
-        cookie = context.user_data.get("email_cookie", "")
-        username = context.user_data.get("email_username", "")
-        msg = await update.message.reply_text("Привязываю почту...")
-        loop2 = asyncio.get_event_loop()
-        success, response = await loop2.run_in_executor(
-            executor, link_email_playwright, cookie, email_addr
-        )
-        if success:
-            await msg.edit_text(
-                "*Почта успешно привязана!*\n\n"
-                "Аккаунт: *" + username + "*\n"
-                "Email: `" + email_addr + "`\n\n"
-                "Проверь почту для подтверждения.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("В меню", callback_data="main_menu")]
-                ])
-            )
-        else:
-            await msg.edit_text(
-                "*Ошибка привязки почты*\n\n"
-                "Возможные причины:\n"
-                "- Email уже используется другим аккаунтом\n"
-                "- Неверный формат email\n"
-                "- Проблема с сессией\n\n"
-                "Причина: `" + str(response)[:150] + "`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Попробовать снова", callback_data="link_email")],
-                    [InlineKeyboardButton("В меню", callback_data="main_menu")],
-                ])
-            )
-        return WAITING_MENU
-
     # Иначе — обрабатываем как cookie
     return await receive_cookie_inner(update, context)
 
@@ -1238,14 +967,6 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
             ],
             WAITING_ADMIN_CREATE_PROMO: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_EMAIL_COOKIE: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_EMAIL_INPUT: [
                 CallbackQueryHandler(handle_callback),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
             ],
