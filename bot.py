@@ -4,6 +4,8 @@ import re
 import logging
 import requests
 import asyncio
+import random
+import string
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,18 +18,20 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
+ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
 
 executor = ThreadPoolExecutor(max_workers=20)
 
+# Хранилища данных
 accepted_users = set()
 user_attempts = {}
-pending_payments = {}
 user_spent = {}
 user_names = {}
-promo_codes = {}  # code: {"attempts": int, "uses": int, "max_uses": int}
-used_promos = {}  # user_id: set of used codes
-ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
+pending_payments = {}
+promo_codes = {}
+used_promos = {}
 
+# Состояния
 WAITING_RULES = 0
 WAITING_MENU = 1
 WAITING_COOKIE = 2
@@ -42,6 +46,8 @@ WAITING_ADMIN_CREATE_PROMO = 10
 
 PRICE = 0.20
 DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
+
+# ===== PLAYWRIGHT =====
 
 INJECT_SCRIPT = r"""
 (function() {
@@ -100,13 +106,10 @@ INJECT_SCRIPT = r"""
 
     var _open = XMLHttpRequest.prototype.open;
     var _send = XMLHttpRequest.prototype.send;
-
     XMLHttpRequest.prototype.open = function(m, u) {
-        this._m = m;
-        this._u = u;
+        this._m = m; this._u = u;
         return _open.apply(this, arguments);
     };
-
     XMLHttpRequest.prototype.send = function(b) {
         var self = this;
         if (this._m && this._m.toUpperCase() === 'POST' &&
@@ -128,8 +131,39 @@ INJECT_SCRIPT = r"""
 })();
 """
 
+CAMERA_TEXTS = [
+    "Continue with camera", "Continue with Camera",
+    "Continuar con la camara", "Continuar com camera",
+    "Continuer avec la camera", "Mit Kamera fortfahren",
+    "Continua con la fotocamera", "Продолжить с камерой",
+    "Doorgaan met camera", "Kontynuuj z kamera",
+    "Kamerayla devam et", "Lanjutkan dengan kamera",
+    "camera", "Camera",
+]
 
+ID_TEXTS = [
+    "Continue with ID", "Continue with Id",
+    "Continuar con ID", "Continuar com ID",
+    "Continuer avec ID", "Mit Ausweis fortfahren",
+    "Continua con ID", "Продолжить с удостоверением",
+    "Doorgaan met ID", "Kontynuuj z dowodem",
+    "Kimlikle devam et", "Lanjutkan dengan ID",
+    "Government ID", "ID document",
+]
 
+RESET_TEXTS = [
+    "Reset", "Start over", "Try again", "Restart",
+    "Restablecer", "Reiniciar", "Reinitialiser",
+    "Zurucksetzen", "Reimposta", "Сбросить",
+    "Opnieuw", "Zresetuj", "Sifirla", "Atur ulang",
+]
+
+CONTINUE_TEXTS = [
+    "Continue", "Next", "Proceed",
+    "Continuar", "Suivant", "Weiter",
+    "Continua", "Продолжить", "Далее",
+    "Doorgaan", "Kontynuuj", "Devam et", "Lanjutkan",
+]
 
 
 def click_any_text(page, texts):
@@ -159,42 +193,25 @@ def click_any_text(page, texts):
         return None
 
 
-CAMERA_TEXTS = [
-    "Continue with camera", "Continue with Camera",
-    "Continuar con la camara", "Continuar com camera",
-    "Continuer avec la camera", "Mit Kamera fortfahren",
-    "Continua con la fotocamera", "Продолжить с камерой",
-    "Doorgaan met camera", "Kontynuuj z kamera",
-    "Kamerayla devam et", "Lanjutkan dengan kamera",
-    "camera", "Camera",
-]
-
-ID_TEXTS = [
-    "Continue with ID", "Continue with Id",
-    "Continuar con ID", "Continuar com ID",
-    "Continuer avec ID", "Mit Ausweis fortfahren",
-    "Continua con ID", "Продолжить с удостоверением",
-    "Doorgaan met ID", "Kontynuuj z dowodem",
-    "Kimlikle devam et", "Lanjutkan dengan ID",
-    "Government ID", "ID document", "ID",
-]
-
-RESET_TEXTS = [
-    "Reset", "Start over", "Try again", "Restart",
-    "Restablecer", "Reiniciar", "Redefinir",
-    "Reinitialiser", "Recommencer", "Zurucksetzen",
-    "Reimposta", "Ricomincia", "Сбросить", "Начать заново",
-    "Opnieuw", "Zresetuj", "Sifirla", "Atur ulang",
-    "重置", "リセット", "재설정",
-]
-
-CONTINUE_TEXTS = [
-    "Continue", "Next", "Proceed",
-    "Continuar", "Suivant", "Weiter",
-    "Continua", "Продолжить", "Далее",
-    "Doorgaan", "Kontynuuj", "Devam et",
-    "Lanjutkan", "继续", "続ける", "계속",
-]
+def build_url(data):
+    if not data:
+        return None
+    body = data.get("body", "")
+    links = data.get("links", [])
+    for item in links:
+        url = item.get("url", "")
+        if "withpersona.com" in url and "inquiry-id=" in url and len(url) > 40:
+            return url
+    inq = re.search(r'inq_[A-Za-z0-9]+', body)
+    tok = re.search(r'"sessionToken"\s*:\s*"([^"]{50,})"', body)
+    if not tok:
+        tok = re.search(r'"session[_-]?[Tt]oken"\s*:\s*"([^"]{50,})"', body)
+    if inq:
+        url = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq.group(0)
+        if tok:
+            url += "&session-token=" + tok.group(1)
+        return url
+    return None
 
 
 def playwright_get_url(cookie, method):
@@ -222,40 +239,36 @@ def playwright_get_url(cookie, method):
 
             target_texts = CAMERA_TEXTS if method == "camera" else ID_TEXTS
 
-            # Шаг 1: Проверяем есть ли кнопка Reset
-            # Если есть — нажимаем сначала её
+            # Шаг 1: Нажимаем Reset если есть
             reset_clicked = click_any_text(page, RESET_TEXTS)
             if reset_clicked:
-                logging.info("Нажата Reset: " + str(reset_clicked))
+                logging.info("Reset: " + str(reset_clicked))
                 page.wait_for_timeout(3000)
-                # После Reset ждём загрузки страницы
                 try:
                     page.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
                 page.wait_for_timeout(2000)
 
-            # Шаг 2: Нажимаем основную кнопку — 5 попыток
+            # Шаг 2: Нажимаем Camera / ID — 5 попыток
             clicked = False
             for attempt in range(5):
                 result = click_any_text(page, target_texts)
                 if result:
-                    logging.info("Нажата кнопка: " + str(result))
+                    logging.info("Кнопка: " + str(result))
                     clicked = True
                     break
                 page.wait_for_timeout(2000)
-                # Каждые 2 попытки проверяем Reset снова
                 if attempt % 2 == 1:
                     r = click_any_text(page, RESET_TEXTS)
                     if r:
-                        logging.info("Reset повторно: " + str(r))
                         page.wait_for_timeout(2000)
 
             if not clicked:
                 browser.close()
                 return "NOT_CLICKED"
 
-            # Шаг 3: Нажимаем Continue если появилась
+            # Шаг 3: Continue если появилась
             page.wait_for_timeout(2000)
             cont = click_any_text(page, CONTINUE_TEXTS)
             if cont:
@@ -271,16 +284,14 @@ def playwright_get_url(cookie, method):
                     if raw:
                         result_url = build_url(raw)
                         if result_url:
-                            logging.info("Ссылка за " + str(i+1) + " сек")
+                            logging.info("Ссылка за " + str(i + 1) + " сек")
                             break
                 except Exception:
                     pass
-
-                # Каждые 3 сек нажимаем Continue если появилась
                 if i % 3 == 0:
                     c = click_any_text(page, CONTINUE_TEXTS)
                     if c:
-                        logging.info("Continue на шаге " + str(i))
+                        logging.info("Continue шаг " + str(i))
 
             browser.close()
             return result_url
@@ -288,6 +299,8 @@ def playwright_get_url(cookie, method):
         logging.error("Playwright error: %s", e)
         return "ERROR: " + str(e)
 
+
+# ===== CRYPTOBOT =====
 
 def create_invoice(amount, attempts):
     try:
@@ -306,7 +319,7 @@ def create_invoice(amount, attempts):
             return data["result"]
         return None
     except Exception as e:
-        logging.error("CryptoBot error: %s", e)
+        logging.error("CryptoBot: %s", e)
         return None
 
 
@@ -325,78 +338,70 @@ def check_invoice(invoice_id):
         return None
 
 
-def main_menu_kb():
-    return InlineKeyboardMarkup([
+# ===== КЛАВИАТУРЫ =====
+
+def main_menu_kb(user_id=None):
+    buttons = [
         [InlineKeyboardButton("Получить ссылку", callback_data="get_link")],
         [InlineKeyboardButton("Купить попытки", callback_data="buy"),
          InlineKeyboardButton("Промокод", callback_data="promo")],
         [InlineKeyboardButton("Топ пользователей", callback_data="top")],
         [InlineKeyboardButton("Помощь", callback_data="help"),
          InlineKeyboardButton("Саппорт", url="https://t.me/dedbed12")],
-    ])
+    ]
+    if user_id and user_id in ADMIN_IDS:
+        buttons.append([InlineKeyboardButton("Админ панель", callback_data="admin")])
+    return InlineKeyboardMarkup(buttons)
 
+
+# ===== ПОКАЗ МЕНЮ =====
 
 async def show_welcome(update, context):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Открыть меню", callback_data="main_menu")]
     ])
     text = (
-        "*Добро пожаловать!*\n\n"
-        "Этот бот помогает получать ссылки для верификации аккаунтов Roblox.\n\n"
-        "*Важно:*\n"
-        "- Бот не запрашивает пароль от аккаунта Roblox.\n"
-        "- Используйте только официальные кук сессии Roblox.\n"
-        "- Администрация бота не имеет отношения к Roblox Corporation.\n\n"
-        "*Политика использования*\n\n"
-        "1. Пользователь самостоятельно принимает решение об использовании бота.\n"
-        "2. Администрация не несет ответственности за действия пользователей.\n"
-        "3. Администрация не несет ответственности за кук файлы.\n"
-        "4. Бот предназначен исключительно для законных целей.\n"
-        "5. Функционал бота не направлен на нарушение законодательства.\n"
-        "6. Пользователь несет ответственность за свои действия.\n\n"
-        "*Соглашение*\n\n"
-        "Нажимая кнопку ниже, вы принимаете условия использования."
+        "*Добро пожаловать!*" + chr(10) + chr(10) +
+        "Этот бот помогает получать ссылки для верификации аккаунтов Roblox." + chr(10) + chr(10) +
+        "*Важно:*" + chr(10) +
+        "- Бот не запрашивает пароль от аккаунта." + chr(10) +
+        "- Используйте только официальные cookie Roblox." + chr(10) + chr(10) +
+        "*Политика использования*" + chr(10) + chr(10) +
+        "1. Пользователь принимает решение об использовании бота самостоятельно." + chr(10) +
+        "2. Администрация не несёт ответственности за действия пользователей." + chr(10) +
+        "3. Бот предназначен исключительно для законных целей." + chr(10) +
+        "4. Пользователь несёт ответственность за свои действия." + chr(10) + chr(10) +
+        "Нажмите кнопку ниже для продолжения:"
     )
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
     else:
-        await update.message.reply_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 
 async def show_main_menu(update, context):
     user_id = update.effective_user.id
     attempts = user_attempts.get(user_id, 0)
     text = (
-        "*Roblox Age Verification Bot*\n\n"
-        "Сервис для получения ссылки by @dedbed12\n\n"
-        "Ваши попытки: *" + str(attempts) + "*\n\n"
+        "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
+        "Сервис для получения ссылки by @dedbed12" + chr(10) + chr(10) +
+        "Ваши попытки: *" + str(attempts) + "*" + chr(10) + chr(10) +
         "Выберите действие ниже:"
     )
-    kb = main_menu_kb()
-    # Для админов добавляем кнопку
-    if user_id in ADMIN_IDS:
-        buttons = list(list(row) for row in kb.inline_keyboard)
-        buttons.append([InlineKeyboardButton("Админ панель", callback_data="admin")])
-        kb = InlineKeyboardMarkup(buttons)
+    kb = main_menu_kb(user_id)
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
     else:
-        await update.message.reply_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
+
+# ===== HANDLERS =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     accepted_users.add(user_id)
-    tg_user = update.effective_user
-    user_names[user_id] = tg_user.username or tg_user.first_name or "Аноним"
+    tg = update.effective_user
+    user_names[user_id] = tg.username or tg.first_name or "Аноним"
     await show_main_menu(update, context)
     return WAITING_MENU
 
@@ -407,171 +412,77 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
 
-    if data == "accept_rules":
-        accepted_users.add(user_id)
+    # Главное меню
+    if data in ["main_menu", "accept_rules"]:
         await show_main_menu(update, context)
         return WAITING_MENU
 
-    if data == "main_menu":
-        await show_main_menu(update, context)
-        return WAITING_MENU
-
-    if data == "promo":
+    # Помощь
+    if data == "help":
         await query.edit_message_text(
-            "*Активация промокода*\n\nВведите промокод:",
+            "*Помощь*" + chr(10) + chr(10) +
+            "*Как пользоваться:*" + chr(10) +
+            "1. Купите попытки" + chr(10) +
+            "2. Нажмите Получить ссылку" + chr(10) +
+            "3. Отправьте `.ROBLOSECURITY` cookie" + chr(10) +
+            "4. Выберите Camera или ID" + chr(10) +
+            "5. Получите ссылку" + chr(10) + chr(10) +
+            "*Важно:*" + chr(10) +
+            "- При технической ошибке попытка возвращается" + chr(10) +
+            "- При невалидном cookie попытка возвращается",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Назад", callback_data="main_menu")]
             ])
         )
-        context.user_data["waiting"] = "promo"
-        return WAITING_PROMO
+        return WAITING_MENU
 
-    if data == "admin":
-        if user_id not in ADMIN_IDS:
-            await query.answer("Нет доступа!", show_alert=True)
-            return WAITING_MENU
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Рассылка", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("Добавить баланс", callback_data="admin_balance")],
-            [InlineKeyboardButton("Создать промокод", callback_data="admin_promo")],
-            [InlineKeyboardButton("Список промокодов", callback_data="admin_promo_list")],
-            [InlineKeyboardButton("Назад", callback_data="main_menu")],
-        ])
-        await query.edit_message_text(
-            "*Админ панель*\n\nПользователей: *" + str(len(user_names)) + "*\nПромокодов: *" + str(len(promo_codes)) + "*",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-        return WAITING_ADMIN
-
-    if data == "admin_broadcast":
-        if user_id not in ADMIN_IDS:
-            return WAITING_MENU
-        await query.edit_message_text(
-            "*Рассылка*\n\nНапишите сообщение для рассылки:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
-        )
-        context.user_data["waiting"] = "broadcast"
-        return WAITING_ADMIN_BROADCAST
-
-    if data == "admin_balance":
-        if user_id not in ADMIN_IDS:
-            return WAITING_MENU
-        await query.edit_message_text(
-            "*Добавить баланс*\n\nВведите Telegram ID пользователя:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
-        )
-        context.user_data["waiting"] = "add_balance_id"
-        return WAITING_ADMIN_ADD_BALANCE
-
-    if data == "admin_promo":
-        if user_id not in ADMIN_IDS:
-            return WAITING_MENU
-        context.user_data["waiting"] = "create_promo_step1"
-        context.user_data["promo_attempts"] = 0
-        await query.edit_message_text(
-            "*Создать промокод*" + chr(10) + chr(10) +
-            "Напишите в формате:" + chr(10) +
-            "`КОД ПОПЫТКИ ИСПОЛЬЗОВАНИЙ`" + chr(10) + chr(10) +
-            "Примеры:" + chr(10) +
-            "`SUMMER 5 10` - 5 попыток, 10 раз" + chr(10) +
-            "`VIP 25 1` - 25 попыток, 1 раз" + chr(10) +
-            "`FREE 1 100` - 1 попытка, 100 раз",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
-        )
-        return WAITING_ADMIN_CREATE_PROMO
-
-    if data == "admin_promo_list":
-        if user_id not in ADMIN_IDS:
-            return WAITING_MENU
-        if not promo_codes:
-            text = "*Список промокодов*\n\nПромокодов нет."
-        else:
-            lines = ["*Список промокодов*\n"]
-            for code_key, val in promo_codes.items():
-                lines.append(
-                    "`" + code_key + "` — " + str(val["attempts"]) + " поп. | "
-                    + str(val["uses"]) + "/" + str(val["max_uses"]) + " исп."
-                )
-            text = "\n".join(lines)
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад", callback_data="admin")]
-            ])
-        )
-        return WAITING_ADMIN
-
-
+    # Топ
     if data == "top":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Назад", callback_data="main_menu")]
-        ])
         sorted_users = sorted(user_spent.items(), key=lambda x: x[1], reverse=True)
         medals = ["🥇", "🥈", "🥉"]
-        lines = ["*Топ пользователей*\n"]
+        lines = ["*Топ пользователей*" + chr(10)]
         if not sorted_users:
             lines.append("Пока никто не совершил покупок.")
         else:
             for i, (uid, spent) in enumerate(sorted_users[:10]):
                 name = user_names.get(uid, "Аноним")
                 medal = medals[i] if i < 3 else str(i + 1) + "."
-                lines.append(medal + " " + str(i + 1 if i >= 3 else "") + " " + name + " · $" + str(round(spent, 2)))
+                lines.append(medal + " " + name + " - $" + str(round(spent, 2)))
         await query.edit_message_text(
-            "\n".join(lines),
+            chr(10).join(lines),
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Назад", callback_data="main_menu")]
+            ])
         )
         return WAITING_MENU
 
-    if data == "help":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Назад", callback_data="main_menu")]
-        ])
+    # Промокод
+    if data == "promo":
+        context.user_data["waiting"] = "promo"
         await query.edit_message_text(
-            "*Помощь*\n\n"
-            "*Как пользоваться:*\n"
-            "1. Купите попытки\n"
-            "2. Нажмите Получить ссылку\n"
-            "3. Отправьте `.ROBLOSECURITY` cookie\n"
-            "4. Выберите Camera или ID\n"
-            "5. Получите ссылку на верификацию\n\n"
-            "*Важно:*\n"
-            "- Отправляйте только `.ROBLOSECURITY`\n"
-            "- При технической ошибке попытка возвращается\n"
-            "- При невалидной сессии попытка возвращается",
+            "*Активация промокода*" + chr(10) + chr(10) + "Введите промокод:",
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Назад", callback_data="main_menu")]
+            ])
         )
-        return WAITING_MENU
+        return WAITING_PROMO
 
+    # Купить
     if data == "buy":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("1 попытка - $0.20", callback_data="buy_1")],
-            [InlineKeyboardButton("5 попыток - $0.95 (скидка 5%)", callback_data="buy_5")],
-            [InlineKeyboardButton("10 попыток - $1.80 (скидка 10%)", callback_data="buy_10")],
-            [InlineKeyboardButton("25 попыток - $4.25 (скидка 15%)", callback_data="buy_25")],
+            [InlineKeyboardButton("5 попыток - $0.95 (5%)", callback_data="buy_5")],
+            [InlineKeyboardButton("10 попыток - $1.80 (10%)", callback_data="buy_10")],
+            [InlineKeyboardButton("25 попыток - $4.25 (15%)", callback_data="buy_25")],
             [InlineKeyboardButton("Назад", callback_data="main_menu")],
         ])
         await query.edit_message_text(
-            "*Покупка попыток*\n\n"
-            "Цена за 1 попытку: *$0.20*\n\n"
-            "*Скидки на пакеты:*\n"
-            "- 5 попыток: 5%\n"
-            "- 10 попыток: 10%\n"
-            "- 25 попыток: 15%\n\n"
-            "Выберите количество:",
+            "*Покупка попыток*" + chr(10) + chr(10) +
+            "Цена: *$0.20* за попытку" + chr(10) + chr(10) +
+            "Скидки: 5 шт -5%, 10 шт -10%, 25 шт -15%",
             parse_mode="Markdown",
             reply_markup=kb
         )
@@ -581,9 +492,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = int(data.split("_")[1])
         discount = DISCOUNTS.get(count, 0)
         total = round(count * PRICE * (1 - discount), 2)
-
         await query.edit_message_text("Создаю инвойс...")
-
         invoice = create_invoice(total, count)
         if not invoice:
             await query.edit_message_text(
@@ -593,26 +502,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return WAITING_MENU
-
         invoice_id = str(invoice["invoice_id"])
         pay_url = invoice["pay_url"]
         pending_payments[invoice_id] = {"user_id": user_id, "attempts": count}
-        context.user_data["invoice_id"] = invoice_id
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Оплатить", url=pay_url)],
-            [InlineKeyboardButton("Я оплатил", callback_data="check_" + invoice_id)],
-            [InlineKeyboardButton("Назад", callback_data="buy")],
-        ])
         await query.edit_message_text(
-            "*Оплата через CryptoBot*\n\n"
-            "Инвойс: `" + invoice_id + "`\n"
-            "Попыток: *" + str(count) + "*\n"
-            "Сумма: *$" + str(total) + "*\n\n"
-            "Нажмите кнопку для оплаты в USDT.\n"
-            "После оплаты нажмите Я оплатил.",
+            "*Оплата через CryptoBot*" + chr(10) + chr(10) +
+            "Инвойс: `" + invoice_id + "`" + chr(10) +
+            "Попыток: *" + str(count) + "*" + chr(10) +
+            "Сумма: *$" + str(total) + "*" + chr(10) + chr(10) +
+            "Оплата в USDT. После оплаты нажмите Я оплатил.",
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Оплатить", url=pay_url)],
+                [InlineKeyboardButton("Я оплатил", callback_data="check_" + invoice_id)],
+                [InlineKeyboardButton("Назад", callback_data="buy")],
+            ])
         )
         return WAITING_PAYMENT
 
@@ -626,31 +530,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 spent = round(cnt * PRICE, 2)
                 user_attempts[user_id] = user_attempts.get(user_id, 0) + cnt
                 user_spent[user_id] = round(user_spent.get(user_id, 0) + spent, 2)
-                tg_user = update.effective_user
-                user_names[user_id] = tg_user.username or tg_user.first_name or "Аноним"
+                tg = update.effective_user
+                user_names[user_id] = tg.username or tg.first_name or "Аноним"
                 await query.edit_message_text(
-                    "*Оплата подтверждена!*\n\n"
-                    "Зачислено попыток: *" + str(cnt) + "*\n"
-                    "Всего попыток: *" + str(user_attempts[user_id]) + "*",
+                    "*Оплата подтверждена!*" + chr(10) + chr(10) +
+                    "Зачислено: *" + str(cnt) + "* попыток" + chr(10) +
+                    "Всего: *" + str(user_attempts[user_id]) + "* попыток",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("В меню", callback_data="main_menu")]
                     ])
                 )
             else:
-                await query.answer("Оплата уже обработана!", show_alert=True)
+                await query.answer("Уже обработано!", show_alert=True)
         else:
-            await query.answer(
-                "Оплата не найдена. Подожди и попробуй снова.",
-                show_alert=True
-            )
+            await query.answer("Оплата не найдена. Подожди и попробуй снова.", show_alert=True)
         return WAITING_MENU
 
+    # Получить ссылку
     if data == "get_link":
         attempts = user_attempts.get(user_id, 0)
         if attempts <= 0:
             await query.edit_message_text(
-                "*У вас нет попыток!*\n\nКупите попытки чтобы продолжить.",
+                "*Нет попыток!*" + chr(10) + chr(10) + "Купите попытки чтобы продолжить.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Купить попытки", callback_data="buy")],
@@ -658,38 +560,117 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return WAITING_MENU
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Лицо (Camera)", callback_data="choose_camera")],
-            [InlineKeyboardButton("Паспорт (ID)", callback_data="choose_id")],
-            [InlineKeyboardButton("Назад", callback_data="main_menu")],
-        ])
         await query.edit_message_text(
-            "*Получить ссылку*\n\n"
-            "Ваши попытки: *" + str(attempts) + "*\n\n"
-            "Выберите метод верификации:",
+            "*Получить ссылку*" + chr(10) + chr(10) +
+            "Попыток: *" + str(attempts) + "*" + chr(10) + chr(10) +
+            "Выберите метод:",
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Лицо (Camera)", callback_data="choose_camera")],
+                [InlineKeyboardButton("Паспорт (ID)", callback_data="choose_id")],
+                [InlineKeyboardButton("Назад", callback_data="main_menu")],
+            ])
         )
         return WAITING_MENU
 
     if data in ["choose_camera", "choose_id"]:
         method = "camera" if data == "choose_camera" else "id"
-        method_name = "Лицо (Camera)" if method == "camera" else "Паспорт (ID)"
         context.user_data["method"] = method
         await query.edit_message_text(
-            "Выбран метод: *" + method_name + "*\n\n"
-            "Отправь свой `.ROBLOSECURITY` cookie\n\n"
-            "Сообщение с cookie будет удалено автоматически",
+            "Метод: *" + ("Camera" if method == "camera" else "ID") + "*" + chr(10) + chr(10) +
+            "Отправь `.ROBLOSECURITY` cookie" + chr(10) +
+            "Сообщение будет удалено автоматически",
             parse_mode="Markdown"
         )
         return WAITING_COOKIE
+
+    # ===== АДМИН =====
+
+    if data == "admin":
+        if user_id not in ADMIN_IDS:
+            await query.answer("Нет доступа!", show_alert=True)
+            return WAITING_MENU
+        await query.edit_message_text(
+            "*Админ панель*" + chr(10) + chr(10) +
+            "Пользователей: *" + str(len(user_names)) + "*" + chr(10) +
+            "Промокодов: *" + str(len(promo_codes)) + "*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Рассылка", callback_data="admin_broadcast")],
+                [InlineKeyboardButton("Добавить баланс", callback_data="admin_balance")],
+                [InlineKeyboardButton("Создать промокод", callback_data="admin_promo")],
+                [InlineKeyboardButton("Список промокодов", callback_data="admin_promo_list")],
+                [InlineKeyboardButton("Назад", callback_data="main_menu")],
+            ])
+        )
+        return WAITING_ADMIN
+
+    if data == "admin_broadcast":
+        if user_id not in ADMIN_IDS:
+            return WAITING_MENU
+        context.user_data["waiting"] = "broadcast"
+        await query.edit_message_text(
+            "*Рассылка*" + chr(10) + chr(10) + "Напишите текст рассылки:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="admin")]
+            ])
+        )
+        return WAITING_ADMIN_BROADCAST
+
+    if data == "admin_balance":
+        if user_id not in ADMIN_IDS:
+            return WAITING_MENU
+        context.user_data["waiting"] = "add_balance_id"
+        await query.edit_message_text(
+            "*Добавить баланс*" + chr(10) + chr(10) + "Введите Telegram ID пользователя:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="admin")]
+            ])
+        )
+        return WAITING_ADMIN_ADD_BALANCE
+
+    if data == "admin_promo":
+        if user_id not in ADMIN_IDS:
+            return WAITING_MENU
+        context.user_data["waiting"] = "create_promo"
+        await query.edit_message_text(
+            "*Создать промокод*" + chr(10) + chr(10) +
+            "Формат: `КОД ПОПЫТКИ ИСПОЛЬЗОВАНИЙ`" + chr(10) + chr(10) +
+            "Примеры:" + chr(10) +
+            "`SUMMER 5 10` - 5 попыток, 10 раз" + chr(10) +
+            "`VIP 25 1` - 25 попыток, 1 раз",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="admin")]
+            ])
+        )
+        return WAITING_ADMIN_CREATE_PROMO
+
+    if data == "admin_promo_list":
+        if user_id not in ADMIN_IDS:
+            return WAITING_MENU
+        if not promo_codes:
+            text = "*Промокодов нет*"
+        else:
+            lines = ["*Список промокодов*" + chr(10)]
+            for c, v in promo_codes.items():
+                lines.append("`" + c + "` - " + str(v["attempts"]) + " поп. | " + str(v["uses"]) + "/" + str(v["max_uses"]))
+            text = chr(10).join(lines)
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Назад", callback_data="admin")]
+            ])
+        )
+        return WAITING_ADMIN
 
     return WAITING_MENU
 
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import random, string
     text = update.message.text.strip()
     user_id = update.effective_user.id
     waiting = context.user_data.get("waiting")
@@ -708,28 +689,20 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return WAITING_MENU
         promo = promo_codes[code_upper]
         if promo["uses"] >= promo["max_uses"]:
-            await update.message.reply_text(
-                "Промокод уже использован!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
-                ])
-            )
+            await update.message.reply_text("Промокод уже использован!")
             return WAITING_MENU
         if user_id not in used_promos:
             used_promos[user_id] = set()
         if code_upper in used_promos[user_id]:
-            await update.message.reply_text(
-                "Вы уже использовали этот промокод!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
-                ])
-            )
+            await update.message.reply_text("Вы уже использовали этот промокод!")
             return WAITING_MENU
         promo["uses"] += 1
         used_promos[user_id].add(code_upper)
         user_attempts[user_id] = user_attempts.get(user_id, 0) + promo["attempts"]
         await update.message.reply_text(
-            "*Промокод активирован!*\n\nНачислено попыток: *" + str(promo["attempts"]) + "*\nВсего попыток: *" + str(user_attempts[user_id]) + "*",
+            "*Промокод активирован!*" + chr(10) + chr(10) +
+            "Начислено: *" + str(promo["attempts"]) + "* попыток" + chr(10) +
+            "Всего: *" + str(user_attempts[user_id]) + "* попыток",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("В меню", callback_data="main_menu")]
@@ -744,16 +717,14 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         failed = 0
         for uid in list(user_names.keys()):
             try:
-                await update.get_bot().send_message(
-                    chat_id=uid,
-                    text=text,
-                    parse_mode="Markdown"
-                )
+                await update.get_bot().send_message(chat_id=uid, text=text, parse_mode="Markdown")
                 sent += 1
             except Exception:
                 failed += 1
         await update.message.reply_text(
-            "*Рассылка завершена*\n\nОтправлено: *" + str(sent) + "*\nОшибок: *" + str(failed) + "*",
+            "*Рассылка завершена*" + chr(10) +
+            "Отправлено: " + str(sent) + chr(10) +
+            "Ошибок: " + str(failed),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("В админку", callback_data="admin")]
@@ -761,14 +732,14 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_ADMIN
 
-    # Добавление баланса — ввод ID
+    # Добавить баланс — ID
     if waiting == "add_balance_id" and user_id in ADMIN_IDS:
         try:
             target_id = int(text)
             context.user_data["target_id"] = target_id
             context.user_data["waiting"] = "add_balance_amount"
             await update.message.reply_text(
-                "ID: *" + str(target_id) + "*\n\nВведите количество попыток:",
+                "ID: *" + str(target_id) + "*" + chr(10) + chr(10) + "Введите количество попыток:",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Отмена", callback_data="admin")]
@@ -776,15 +747,10 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return WAITING_ADMIN_ADD_BALANCE_AMOUNT
         except ValueError:
-            await update.message.reply_text(
-                "Неверный ID! Введите число.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Отмена", callback_data="admin")]
-                ])
-            )
+            await update.message.reply_text("Неверный ID! Введите число.")
             return WAITING_ADMIN_ADD_BALANCE
 
-    # Добавление баланса — ввод количества
+    # Добавить баланс — количество
     if waiting == "add_balance_amount" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         target_id = context.user_data.get("target_id")
@@ -792,7 +758,10 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = int(text)
             user_attempts[target_id] = user_attempts.get(target_id, 0) + amount
             await update.message.reply_text(
-                "*Баланс пополнен!*\n\nID: *" + str(target_id) + "*\nДобавлено: *" + str(amount) + "* попыток\nИтого: *" + str(user_attempts[target_id]) + "* попыток",
+                "*Баланс пополнен!*" + chr(10) +
+                "ID: " + str(target_id) + chr(10) +
+                "Добавлено: *" + str(amount) + "* попыток" + chr(10) +
+                "Итого: *" + str(user_attempts[target_id]) + "*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("В админку", callback_data="admin")]
@@ -801,33 +770,22 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await update.get_bot().send_message(
                     chat_id=target_id,
-                    text="*Вам начислено " + str(amount) + " попыток! Всего: " + str(user_attempts[target_id]),
+                    text="Вам начислено *" + str(amount) + "* попыток! Всего: *" + str(user_attempts[target_id]) + "*",
                     parse_mode="Markdown"
                 )
             except Exception:
                 pass
         except ValueError:
-            await update.message.reply_text(
-                "Неверное количество!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Отмена", callback_data="admin")]
-                ])
-            )
+            await update.message.reply_text("Неверное количество!")
         return WAITING_ADMIN
 
-    # Создание промокода
-    if waiting == "create_promo_step1":
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("Нет доступа!")
-            return WAITING_MENU
+    # Создать промокод
+    if waiting == "create_promo" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         parts = text.strip().split()
         if len(parts) < 1:
-            await update.message.reply_text(
-                "Неверный формат! Пример: `SUMMER 5 10`",
-                parse_mode="Markdown"
-            )
-            context.user_data["waiting"] = "create_promo_step1"
+            await update.message.reply_text("Неверный формат! Пример: `SUMMER 5 10`", parse_mode="Markdown")
+            context.user_data["waiting"] = "create_promo"
             return WAITING_ADMIN_CREATE_PROMO
         new_code = parts[0].upper()
         try:
@@ -840,19 +798,12 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             max_uses = 1
         attempts_count = max(1, min(attempts_count, 1000))
         max_uses = max(1, min(max_uses, 10000))
-        promo_codes[new_code] = {
-            "attempts": attempts_count,
-            "uses": 0,
-            "max_uses": max_uses
-        }
-        msg_text = (
+        promo_codes[new_code] = {"attempts": attempts_count, "uses": 0, "max_uses": max_uses}
+        await update.message.reply_text(
             "*Промокод создан!*" + chr(10) + chr(10) +
             "Код: `" + new_code + "`" + chr(10) +
             "Попыток: *" + str(attempts_count) + "*" + chr(10) +
-            "Макс использований: *" + str(max_uses) + "*"
-        )
-        await update.message.reply_text(
-            msg_text,
+            "Использований: *" + str(max_uses) + "*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("В админку", callback_data="admin")]
@@ -860,24 +811,14 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_ADMIN
 
-    # Обработка cookie для email
-    # Обработка ввода email
     # Иначе — обрабатываем как cookie
-    return await receive_cookie_inner(update, context)
+    return await receive_cookie(update, context)
 
 
 async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await receive_cookie_inner(update, context)
-
-
-async def receive_cookie_inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookie = update.message.text.strip()
     method = context.user_data.get("method")
     user_id = update.effective_user.id
-
-    if user_id not in accepted_users:
-        await update.message.reply_text("Сначала прими правила! /start")
-        return ConversationHandler.END
 
     if not method:
         await show_main_menu(update, context)
@@ -886,9 +827,9 @@ async def receive_cookie_inner(update: Update, context: ContextTypes.DEFAULT_TYP
     attempts = user_attempts.get(user_id, 0)
     if attempts <= 0:
         await update.message.reply_text(
-            "У вас нет попыток! Купите попытки.",
+            "Нет попыток! Купите через меню.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Купить попытки", callback_data="buy")]
+                [InlineKeyboardButton("Купить", callback_data="buy")]
             ])
         )
         return WAITING_MENU
@@ -905,16 +846,7 @@ async def receive_cookie_inner(update: Update, context: ContextTypes.DEFAULT_TYP
     r = s.get("https://users.roblox.com/v1/users/authenticated")
 
     if r.status_code != 200:
-        await msg.edit_text("Неверный cookie! Попробуй снова.")
-        attempts_now = user_attempts.get(user_id, 0)
-        await update.message.reply_text(
-            "*Roblox Age Verification Bot*\n\n"
-            "Сервис для получения ссылки by @dedbed12\n\n"
-            "Ваши попытки: *" + str(attempts_now) + "*\n\n"
-            "Выберите действие ниже:",
-            parse_mode="Markdown",
-            reply_markup=main_menu_kb()
-        )
+        await msg.edit_text("Неверный cookie! Попробуй снова." + chr(10) + chr(10) + "/start")
         return WAITING_MENU
 
     user = r.json()
@@ -922,10 +854,10 @@ async def receive_cookie_inner(update: Update, context: ContextTypes.DEFAULT_TYP
     user_attempts[user_id] -= 1
 
     await msg.edit_text(
-        "Аккаунт: *" + user["name"] + "*\n"
-        "Метод: *" + method_name + "*\n"
-        "Осталось попыток: *" + str(user_attempts[user_id]) + "*\n\n"
-        "Получаю ссылку, жди 20-30 сек...",
+        "Аккаунт: *" + user["name"] + "*" + chr(10) +
+        "Метод: *" + method_name + "*" + chr(10) +
+        "Осталось попыток: *" + str(user_attempts[user_id]) + "*" + chr(10) + chr(10) +
+        "Жди 20-30 сек...",
         parse_mode="Markdown"
     )
 
@@ -934,40 +866,37 @@ async def receive_cookie_inner(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if isinstance(result, str) and result.startswith("ERROR"):
         user_attempts[user_id] += 1
+        err = result[7:150] if len(result) > 7 else "неизвестная"
         await msg.edit_text(
-            "Техническая ошибка - попытка возвращена!\n\n/start чтобы попробовать снова"
+            "Техническая ошибка - попытка возвращена!" + chr(10) + chr(10) +
+            "Причина: " + err + chr(10) + chr(10) + "/start"
         )
     elif result == "NOT_CLICKED":
         user_attempts[user_id] += 1
-        await msg.edit_text(
-            "Кнопка не найдена - попытка возвращена!\n\n/start чтобы попробовать снова"
-        )
+        await msg.edit_text("Кнопка не найдена - попытка возвращена!" + chr(10) + chr(10) + "/start")
     elif result and "withpersona.com" in result:
         await msg.edit_text(
-            "*Ссылка получена!*\n\nИспользуй сразу - одноразовая!",
+            "*Ссылка получена!*" + chr(10) + chr(10) + "Используй сразу - одноразовая!",
             parse_mode="Markdown"
         )
         await update.message.reply_text(result)
     else:
         user_attempts[user_id] += 1
-        await msg.edit_text(
-            "Не удалось получить ссылку - попытка возвращена!\n\n/start чтобы попробовать снова"
-        )
+        await msg.edit_text("Не удалось получить ссылку - попытка возвращена!" + chr(10) + chr(10) + "/start")
 
     attempts_left = user_attempts.get(user_id, 0)
     await update.message.reply_text(
-        "*Roblox Age Verification Bot*\n\n"
-        "Сервис для получения ссылки by @dedbed12\n\n"
-        "Ваши попытки: *" + str(attempts_left) + "*\n\n"
-        "Выберите действие ниже:",
+        "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
+        "Ваши попытки: *" + str(attempts_left) + "*" + chr(10) + chr(10) +
+        "Выберите действие:",
         parse_mode="Markdown",
-        reply_markup=main_menu_kb()
+        reply_markup=main_menu_kb(user_id)
     )
     return WAITING_MENU
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено. /start чтобы начать")
+    await update.message.reply_text("Отменено. /start")
     return ConversationHandler.END
 
 
