@@ -158,29 +158,53 @@ RESET_TEXTS = [
     "Opnieuw", "Zresetuj", "Sifirla", "Atur ulang",
 ]
 
+# ВАЖНО: не включаем "Continue" т.к. он совпадёт с "Continue with camera/ID"
 CONTINUE_TEXTS = [
-    "Continue", "Next", "Proceed",
-    "Continuar", "Suivant", "Weiter",
-    "Continua", "Продолжить", "Далее",
-    "Doorgaan", "Kontynuuj", "Devam et", "Lanjutkan",
+    "Next", "Proceed", "OK", "Submit",
+    "Suivant", "Weiter", "Avanti",
+    "Далее", "Вперёд",
+    "Volgende", "Nastepny",
 ]
 
 
-def click_any_text(page, texts):
-    js = """(texts) => {
+def click_any_text(page, texts, exclude=None):
+    """
+    exclude: список слов — если текст кнопки содержит их, пропускаем
+    Это нужно чтобы CONTINUE не нажимал "Continue with camera/ID"
+    """
+    if exclude is None:
+        exclude = []
+    js = """(args) => {
+        var texts = args[0];
+        var exclude = args[1];
         var els = document.querySelectorAll('button, a, div[role=button], span[role=button]');
+        // Точное совпадение
         for (var i = 0; i < els.length; i++) {
             var t = els[i].textContent.trim();
+            var tl = t.toLowerCase();
+            // Проверяем исключения
+            var skip = false;
+            for (var e = 0; e < exclude.length; e++) {
+                if (tl.indexOf(exclude[e].toLowerCase()) !== -1) { skip = true; break; }
+            }
+            if (skip) continue;
             for (var j = 0; j < texts.length; j++) {
-                if (t === texts[j] || t.toLowerCase() === texts[j].toLowerCase()) {
+                if (t === texts[j] || tl === texts[j].toLowerCase()) {
                     els[i].click(); return texts[j];
                 }
             }
         }
+        // Частичное совпадение
         for (var i = 0; i < els.length; i++) {
-            var t = els[i].textContent.trim().toLowerCase();
+            var t = els[i].textContent.trim();
+            var tl = t.toLowerCase();
+            var skip = false;
+            for (var e = 0; e < exclude.length; e++) {
+                if (tl.indexOf(exclude[e].toLowerCase()) !== -1) { skip = true; break; }
+            }
+            if (skip) continue;
             for (var j = 0; j < texts.length; j++) {
-                if (t.indexOf(texts[j].toLowerCase()) !== -1) {
+                if (tl.indexOf(texts[j].toLowerCase()) !== -1) {
                     els[i].click(); return texts[j];
                 }
             }
@@ -188,7 +212,7 @@ def click_any_text(page, texts):
         return null;
     }"""
     try:
-        return page.evaluate(js, texts)
+        return page.evaluate(js, [texts, exclude])
     except Exception:
         return None
 
@@ -269,8 +293,10 @@ def playwright_get_url(cookie, method):
                 return "NOT_CLICKED"
 
             # Шаг 3: Continue если появилась
+            # Исключаем camera/ID чтобы не нажать не ту кнопку
+            exclude_words = ["camera", "id", "passport", "камер", "паспорт"]
             page.wait_for_timeout(2000)
-            cont = click_any_text(page, CONTINUE_TEXTS)
+            cont = click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
             if cont:
                 logging.info("Continue: " + str(cont))
                 page.wait_for_timeout(1500)
@@ -289,7 +315,7 @@ def playwright_get_url(cookie, method):
                 except Exception:
                     pass
                 if i % 3 == 0:
-                    c = click_any_text(page, CONTINUE_TEXTS)
+                    c = click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
                     if c:
                         logging.info("Continue шаг " + str(i))
 
