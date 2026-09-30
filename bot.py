@@ -452,10 +452,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. Нажмите Получить ссылку" + chr(10) +
             "3. Отправьте `.ROBLOSECURITY` cookie" + chr(10) +
             "4. Выберите Camera или ID" + chr(10) +
-            "5. Получите ссылку" + chr(10) + chr(10) +
+            "5. Получите ссылку на верификацию" + chr(10) + chr(10) +
             "*Важно:*" + chr(10) +
             "- При технической ошибке попытка возвращается" + chr(10) +
-            "- При невалидном cookie попытка возвращается",
+            "- При невалидном cookie попытка возвращается" + chr(10) +
+            "- Переведите страницу на English и нажмите кнопку Reset" + chr(10) +
+            "- Владелец не несёт ответственности за поломку cookie и не поощряет нарушение законодательства Российской Федерации",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Назад", callback_data="main_menu")]
