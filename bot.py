@@ -2,6 +2,7 @@
 import os
 import re
 import logging
+import sqlite3
 import requests
 import asyncio
 import random
@@ -20,18 +21,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
 
+# 20 потоков для одновременной работы
 executor = ThreadPoolExecutor(max_workers=20)
 
-# Хранилища данных
-accepted_users = set()
-user_attempts = {}
-user_spent = {}
-user_names = {}
 pending_payments = {}
-promo_codes = {}
-used_promos = {}
 
-# Состояния
 WAITING_RULES = 0
 WAITING_MENU = 1
 WAITING_COOKIE = 2
@@ -47,13 +41,150 @@ WAITING_ADMIN_CREATE_PROMO = 10
 PRICE = 0.20
 DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
 
+DB_PATH = "bot_data.db"
+
+# ===== БАЗА ДАННЫХ =====
+
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            attempts INTEGER DEFAULT 0,
+            spent REAL DEFAULT 0.0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            attempts INTEGER DEFAULT 1,
+            uses INTEGER DEFAULT 0,
+            max_uses INTEGER DEFAULT 1
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS used_promos (
+            user_id INTEGER,
+            code TEXT,
+            PRIMARY KEY (user_id, code)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def db_get_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username, attempts, spent FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def db_upsert_user(user_id, username, attempts_delta=0, spent_delta=0.0):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO users (user_id, username, attempts, spent)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            attempts=attempts + ?,
+            spent=spent + ?
+    """, (user_id, username, max(0, attempts_delta), spent_delta,
+          attempts_delta, spent_delta))
+    conn.commit()
+    conn.close()
+
+def db_set_attempts(user_id, username, new_attempts):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO users (user_id, username, attempts, spent)
+        VALUES (?, ?, ?, 0.0)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            attempts=?
+    """, (user_id, username, new_attempts, new_attempts))
+    conn.commit()
+    conn.close()
+
+def db_get_attempts(user_id):
+    row = db_get_user(user_id)
+    return row[1] if row else 0
+
+def db_get_all_users():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, attempts, spent FROM users ORDER BY spent DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_get_top(limit=10):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, spent FROM users WHERE spent > 0 ORDER BY spent DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_get_promo(code):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT attempts, uses, max_uses FROM promo_codes WHERE code=?", (code,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def db_create_promo(code, attempts, max_uses):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO promo_codes (code, attempts, uses, max_uses)
+        VALUES (?, ?, 0, ?)
+    """, (code, attempts, max_uses))
+    conn.commit()
+    conn.close()
+
+def db_use_promo(user_id, code):
+    """Возвращает (успех, сообщение, кол-во попыток)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT attempts, uses, max_uses FROM promo_codes WHERE code=?", (code,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False, "Промокод не найден!", 0
+    attempts, uses, max_uses = row
+    if uses >= max_uses:
+        conn.close()
+        return False, "Промокод уже использован!", 0
+    c.execute("SELECT 1 FROM used_promos WHERE user_id=? AND code=?", (user_id, code))
+    if c.fetchone():
+        conn.close()
+        return False, "Вы уже использовали этот промокод!", 0
+    c.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=?", (code,))
+    c.execute("INSERT INTO used_promos (user_id, code) VALUES (?, ?)", (user_id, code))
+    conn.commit()
+    conn.close()
+    return True, "OK", attempts
+
+def db_get_all_promos():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT code, attempts, uses, max_uses FROM promo_codes")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # ===== PLAYWRIGHT =====
 
 INJECT_SCRIPT = r"""
 (function() {
     window.__capturedData = null;
     var TARGET = 'age-verification-service/v1/persona-id-verification/start-verification';
-
     function extractLinks(text) {
         var links = [];
         try {
@@ -70,30 +201,21 @@ INJECT_SCRIPT = r"""
                             v.indexOf('http') === 0) {
                             links.push({ path: cur, url: v });
                         }
-                    } else if (typeof v === 'object') {
-                        find(v, cur);
-                    }
+                    } else if (typeof v === 'object') { find(v, cur); }
                 }
             };
             find(data, '');
         } catch(e) {
             var m = text.match(/https?:\/\/[^\s"'<>]+/g);
-            if (m) {
-                for (var i = 0; i < m.length; i++) {
-                    links.push({ path: 'match_' + i, url: m[i] });
-                }
-            }
+            if (m) for (var i = 0; i < m.length; i++) links.push({ path: 'match_' + i, url: m[i] });
         }
         return links;
     }
-
     var _fetch = window.fetch;
     window.fetch = async function() {
         var args = Array.prototype.slice.call(arguments);
-        var url = typeof args[0] === 'string' ? args[0] :
-                  (args[0] instanceof Request ? args[0].url : String(args[0]));
-        var method = ((args[1] && args[1].method) ||
-                     (args[0] instanceof Request ? args[0].method : 'GET')).toUpperCase();
+        var url = typeof args[0] === 'string' ? args[0] : (args[0] instanceof Request ? args[0].url : String(args[0]));
+        var method = ((args[1] && args[1].method) || (args[0] instanceof Request ? args[0].method : 'GET')).toUpperCase();
         var res = await _fetch.apply(this, args);
         if (method === 'POST' && url.indexOf(TARGET) !== -1) {
             try {
@@ -103,26 +225,15 @@ INJECT_SCRIPT = r"""
         }
         return res;
     };
-
     var _open = XMLHttpRequest.prototype.open;
     var _send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(m, u) {
-        this._m = m; this._u = u;
-        return _open.apply(this, arguments);
-    };
+    XMLHttpRequest.prototype.open = function(m, u) { this._m = m; this._u = u; return _open.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function(b) {
         var self = this;
-        if (this._m && this._m.toUpperCase() === 'POST' &&
-            this._u && this._u.indexOf(TARGET) !== -1) {
+        if (this._m && this._m.toUpperCase() === 'POST' && this._u && this._u.indexOf(TARGET) !== -1) {
             this.addEventListener('loadend', function() {
                 if (self.status >= 200 && self.status < 300) {
-                    try {
-                        window.__capturedData = {
-                            url: self._u,
-                            body: self.responseText,
-                            links: extractLinks(self.responseText)
-                        };
-                    } catch(e) {}
+                    try { window.__capturedData = { url: self._u, body: self.responseText, links: extractLinks(self.responseText) }; } catch(e) {}
                 }
             }, { once: true });
         }
@@ -158,55 +269,35 @@ RESET_TEXTS = [
     "Opnieuw", "Zresetuj", "Sifirla", "Atur ulang",
 ]
 
-# ВАЖНО: не включаем "Continue" т.к. он совпадёт с "Continue with camera/ID"
 CONTINUE_TEXTS = [
     "Next", "Proceed", "OK", "Submit",
     "Suivant", "Weiter", "Avanti",
-    "Далее", "Вперёд",
-    "Volgende", "Nastepny",
+    "Далее", "Вперёд", "Volgende", "Nastepny",
 ]
 
 
 def click_any_text(page, texts, exclude=None):
-    """
-    exclude: список слов — если текст кнопки содержит их, пропускаем
-    Это нужно чтобы CONTINUE не нажимал "Continue with camera/ID"
-    """
     if exclude is None:
         exclude = []
     js = """(args) => {
-        var texts = args[0];
-        var exclude = args[1];
+        var texts = args[0]; var exclude = args[1];
         var els = document.querySelectorAll('button, a, div[role=button], span[role=button]');
-        // Точное совпадение
         for (var i = 0; i < els.length; i++) {
-            var t = els[i].textContent.trim();
-            var tl = t.toLowerCase();
-            // Проверяем исключения
+            var t = els[i].textContent.trim(); var tl = t.toLowerCase();
             var skip = false;
-            for (var e = 0; e < exclude.length; e++) {
-                if (tl.indexOf(exclude[e].toLowerCase()) !== -1) { skip = true; break; }
-            }
+            for (var e = 0; e < exclude.length; e++) { if (tl.indexOf(exclude[e].toLowerCase()) !== -1) { skip = true; break; } }
             if (skip) continue;
             for (var j = 0; j < texts.length; j++) {
-                if (t === texts[j] || tl === texts[j].toLowerCase()) {
-                    els[i].click(); return texts[j];
-                }
+                if (t === texts[j] || tl === texts[j].toLowerCase()) { els[i].click(); return texts[j]; }
             }
         }
-        // Частичное совпадение
         for (var i = 0; i < els.length; i++) {
-            var t = els[i].textContent.trim();
-            var tl = t.toLowerCase();
+            var t = els[i].textContent.trim(); var tl = t.toLowerCase();
             var skip = false;
-            for (var e = 0; e < exclude.length; e++) {
-                if (tl.indexOf(exclude[e].toLowerCase()) !== -1) { skip = true; break; }
-            }
+            for (var e = 0; e < exclude.length; e++) { if (tl.indexOf(exclude[e].toLowerCase()) !== -1) { skip = true; break; } }
             if (skip) continue;
             for (var j = 0; j < texts.length; j++) {
-                if (tl.indexOf(texts[j].toLowerCase()) !== -1) {
-                    els[i].click(); return texts[j];
-                }
+                if (tl.indexOf(texts[j].toLowerCase()) !== -1) { els[i].click(); return texts[j]; }
             }
         }
         return null;
@@ -246,24 +337,15 @@ def playwright_get_url(cookie, method):
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800}
             )
-            ctx.add_cookies([{
-                "name": ".ROBLOSECURITY",
-                "value": cookie,
-                "domain": ".roblox.com",
-                "path": "/"
-            }])
+            ctx.add_cookies([{"name": ".ROBLOSECURITY", "value": cookie, "domain": ".roblox.com", "path": "/"}])
             page = ctx.new_page()
             page.add_init_script(INJECT_SCRIPT)
-            page.goto(
-                "https://www.roblox.com/my/account#!/info",
-                wait_until="networkidle",
-                timeout=30000
-            )
+            page.goto("https://www.roblox.com/my/account#!/info", wait_until="networkidle", timeout=30000)
             page.wait_for_timeout(3000)
 
             target_texts = CAMERA_TEXTS if method == "camera" else ID_TEXTS
+            exclude_words = ["camera", "id", "passport", "камер", "паспорт"]
 
-            # Шаг 1: Нажимаем Reset если есть
             reset_clicked = click_any_text(page, RESET_TEXTS)
             if reset_clicked:
                 logging.info("Reset: " + str(reset_clicked))
@@ -274,7 +356,6 @@ def playwright_get_url(cookie, method):
                     pass
                 page.wait_for_timeout(2000)
 
-            # Шаг 2: Нажимаем Camera / ID — 5 попыток
             clicked = False
             for attempt in range(5):
                 result = click_any_text(page, target_texts)
@@ -292,16 +373,11 @@ def playwright_get_url(cookie, method):
                 browser.close()
                 return "NOT_CLICKED"
 
-            # Шаг 3: Continue если появилась
-            # Исключаем camera/ID чтобы не нажать не ту кнопку
-            exclude_words = ["camera", "id", "passport", "камер", "паспорт"]
             page.wait_for_timeout(2000)
             cont = click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
             if cont:
-                logging.info("Continue: " + str(cont))
                 page.wait_for_timeout(1500)
 
-            # Шаг 4: Ждём ссылку 30 секунд
             result_url = None
             for i in range(30):
                 page.wait_for_timeout(1000)
@@ -315,9 +391,7 @@ def playwright_get_url(cookie, method):
                 except Exception:
                     pass
                 if i % 3 == 0:
-                    c = click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
-                    if c:
-                        logging.info("Continue шаг " + str(i))
+                    click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
 
             browser.close()
             return result_url
@@ -333,17 +407,11 @@ def create_invoice(amount, attempts):
         r = requests.post(
             "https://pay.crypt.bot/api/createInvoice",
             headers={"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN},
-            json={
-                "asset": "USDT",
-                "amount": str(round(amount, 2)),
-                "description": "Pokupka " + str(attempts) + " popytok",
-                "expires_in": 300,
-            }
+            json={"asset": "USDT", "amount": str(round(amount, 2)),
+                  "description": "Pokupka " + str(attempts) + " popytok", "expires_in": 300}
         )
         data = r.json()
-        if data.get("ok"):
-            return data["result"]
-        return None
+        return data["result"] if data.get("ok") else None
     except Exception as e:
         logging.error("CryptoBot: %s", e)
         return None
@@ -357,9 +425,7 @@ def check_invoice(invoice_id):
             params={"invoice_ids": invoice_id}
         )
         data = r.json()
-        if data.get("ok") and data["result"]["items"]:
-            return data["result"]["items"][0]
-        return None
+        return data["result"]["items"][0] if data.get("ok") and data["result"]["items"] else None
     except Exception:
         return None
 
@@ -380,34 +446,9 @@ def main_menu_kb(user_id=None):
     return InlineKeyboardMarkup(buttons)
 
 
-# ===== ПОКАЗ МЕНЮ =====
-
-async def show_welcome(update, context):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Открыть меню", callback_data="main_menu")]
-    ])
-    text = (
-        "*Добро пожаловать!*" + chr(10) + chr(10) +
-        "Этот бот помогает получать ссылки для верификации аккаунтов Roblox." + chr(10) + chr(10) +
-        "*Важно:*" + chr(10) +
-        "- Бот не запрашивает пароль от аккаунта." + chr(10) +
-        "- Используйте только официальные cookie Roblox." + chr(10) + chr(10) +
-        "*Политика использования*" + chr(10) + chr(10) +
-        "1. Пользователь принимает решение об использовании бота самостоятельно." + chr(10) +
-        "2. Администрация не несёт ответственности за действия пользователей." + chr(10) +
-        "3. Бот предназначен исключительно для законных целей." + chr(10) +
-        "4. Пользователь несёт ответственность за свои действия." + chr(10) + chr(10) +
-        "Нажмите кнопку ниже для продолжения:"
-    )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-
-
 async def show_main_menu(update, context):
     user_id = update.effective_user.id
-    attempts = user_attempts.get(user_id, 0)
+    attempts = db_get_attempts(user_id)
     text = (
         "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
         "Сервис для получения ссылки by @dedbed12" + chr(10) + chr(10) +
@@ -425,9 +466,9 @@ async def show_main_menu(update, context):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    accepted_users.add(user_id)
     tg = update.effective_user
-    user_names[user_id] = tg.username or tg.first_name or "Аноним"
+    username = tg.username or tg.first_name or "Аноним"
+    db_upsert_user(user_id, username)
     await show_main_menu(update, context)
     return WAITING_MENU
 
@@ -436,14 +477,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    tg = update.effective_user
+    username = tg.username or tg.first_name or "Аноним"
     data = query.data
 
-    # Главное меню
     if data in ["main_menu", "accept_rules"]:
         await show_main_menu(update, context)
         return WAITING_MENU
 
-    # Помощь
     if data == "help":
         await query.edit_message_text(
             "*Помощь*" + chr(10) + chr(10) +
@@ -457,62 +498,50 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- При технической ошибке попытка возвращается" + chr(10) +
             "- При невалидном cookie попытка возвращается" + chr(10) +
             "- Переведите страницу на English и нажмите кнопку Reset" + chr(10) +
-            "- Владелец не несёт ответственности за поломку cookie и не поощряет нарушение законодательства Российской Федерации",
+            "- Владелец не несёт ответственности за поломку cookie",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад", callback_data="main_menu")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
         )
         return WAITING_MENU
 
-    # Топ
     if data == "top":
-        sorted_users = sorted(user_spent.items(), key=lambda x: x[1], reverse=True)
+        rows = db_get_top(10)
         medals = ["🥇", "🥈", "🥉"]
         lines = ["*Топ пользователей*" + chr(10)]
-        if not sorted_users:
+        if not rows:
             lines.append("Пока никто не совершил покупок.")
         else:
-            for i, (uid, spent) in enumerate(sorted_users[:10]):
-                name = user_names.get(uid, "Аноним")
+            for i, (uid, uname, spent) in enumerate(rows):
                 medal = medals[i] if i < 3 else str(i + 1) + "."
-                lines.append(medal + " " + name + " - $" + str(round(spent, 2)))
+                lines.append(medal + " " + (uname or "Аноним") + " - $" + str(round(spent, 2)))
         await query.edit_message_text(
-            chr(10).join(lines),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад", callback_data="main_menu")]
-            ])
+            chr(10).join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
         )
         return WAITING_MENU
 
-    # Промокод
     if data == "promo":
         context.user_data["waiting"] = "promo"
         await query.edit_message_text(
             "*Активация промокода*" + chr(10) + chr(10) + "Введите промокод:",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад", callback_data="main_menu")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
         )
         return WAITING_PROMO
 
-    # Купить
     if data == "buy":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("1 попытка - $0.20", callback_data="buy_1")],
-            [InlineKeyboardButton("5 попыток - $0.95 (5%)", callback_data="buy_5")],
-            [InlineKeyboardButton("10 попыток - $1.80 (10%)", callback_data="buy_10")],
-            [InlineKeyboardButton("25 попыток - $4.25 (15%)", callback_data="buy_25")],
-            [InlineKeyboardButton("Назад", callback_data="main_menu")],
-        ])
         await query.edit_message_text(
             "*Покупка попыток*" + chr(10) + chr(10) +
             "Цена: *$0.20* за попытку" + chr(10) + chr(10) +
             "Скидки: 5 шт -5%, 10 шт -10%, 25 шт -15%",
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("1 попытка - $0.20", callback_data="buy_1")],
+                [InlineKeyboardButton("5 попыток - $0.95 (5%)", callback_data="buy_5")],
+                [InlineKeyboardButton("10 попыток - $1.80 (10%)", callback_data="buy_10")],
+                [InlineKeyboardButton("25 попыток - $4.25 (15%)", callback_data="buy_25")],
+                [InlineKeyboardButton("Назад", callback_data="main_menu")],
+            ])
         )
         return WAITING_BUY
 
@@ -525,14 +554,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not invoice:
             await query.edit_message_text(
                 "Ошибка создания инвойса. Попробуй позже.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Назад", callback_data="buy")]
-                ])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="buy")]])
             )
             return WAITING_MENU
         invoice_id = str(invoice["invoice_id"])
         pay_url = invoice["pay_url"]
-        pending_payments[invoice_id] = {"user_id": user_id, "attempts": count}
+        pending_payments[invoice_id] = {"user_id": user_id, "attempts": count, "total": total}
         await query.edit_message_text(
             "*Оплата через CryptoBot*" + chr(10) + chr(10) +
             "Инвойс: `" + invoice_id + "`" + chr(10) +
@@ -555,19 +582,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             payment = pending_payments.pop(invoice_id, None)
             if payment:
                 cnt = payment["attempts"]
-                spent = round(cnt * PRICE, 2)
-                user_attempts[user_id] = user_attempts.get(user_id, 0) + cnt
-                user_spent[user_id] = round(user_spent.get(user_id, 0) + spent, 2)
-                tg = update.effective_user
-                user_names[user_id] = tg.username or tg.first_name or "Аноним"
+                total = payment.get("total", cnt * PRICE)
+                db_upsert_user(user_id, username, attempts_delta=cnt, spent_delta=total)
+                new_attempts = db_get_attempts(user_id)
                 await query.edit_message_text(
                     "*Оплата подтверждена!*" + chr(10) + chr(10) +
                     "Зачислено: *" + str(cnt) + "* попыток" + chr(10) +
-                    "Всего: *" + str(user_attempts[user_id]) + "* попыток",
+                    "Всего: *" + str(new_attempts) + "* попыток",
                     parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("В меню", callback_data="main_menu")]
-                    ])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В меню", callback_data="main_menu")]])
                 )
             else:
                 await query.answer("Уже обработано!", show_alert=True)
@@ -575,9 +598,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Оплата не найдена. Подожди и попробуй снова.", show_alert=True)
         return WAITING_MENU
 
-    # Получить ссылку
     if data == "get_link":
-        attempts = user_attempts.get(user_id, 0)
+        attempts = db_get_attempts(user_id)
         if attempts <= 0:
             await query.edit_message_text(
                 "*Нет попыток!*" + chr(10) + chr(10) + "Купите попытки чтобы продолжить.",
@@ -590,8 +612,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return WAITING_MENU
         await query.edit_message_text(
             "*Получить ссылку*" + chr(10) + chr(10) +
-            "Попыток: *" + str(attempts) + "*" + chr(10) + chr(10) +
-            "Выберите метод:",
+            "Попыток: *" + str(attempts) + "*" + chr(10) + chr(10) + "Выберите метод:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Лицо (Camera)", callback_data="choose_camera")],
@@ -618,18 +639,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in ADMIN_IDS:
             await query.answer("Нет доступа!", show_alert=True)
             return WAITING_MENU
+        all_users = db_get_all_users()
+        total_users = len(all_users)
+        total_attempts = sum(r[2] for r in all_users)
+        total_spent = sum(r[3] for r in all_users)
+        promos = db_get_all_promos()
         await query.edit_message_text(
             "*Админ панель*" + chr(10) + chr(10) +
-            "Пользователей: *" + str(len(user_names)) + "*" + chr(10) +
-            "Промокодов: *" + str(len(promo_codes)) + "*",
+            "Пользователей: *" + str(total_users) + "*" + chr(10) +
+            "Всего попыток: *" + str(total_attempts) + "*" + chr(10) +
+            "Всего продаж: *$" + str(round(total_spent, 2)) + "*" + chr(10) +
+            "Промокодов: *" + str(len(promos)) + "*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Рассылка", callback_data="admin_broadcast")],
                 [InlineKeyboardButton("Добавить баланс", callback_data="admin_balance")],
                 [InlineKeyboardButton("Создать промокод", callback_data="admin_promo")],
                 [InlineKeyboardButton("Список промокодов", callback_data="admin_promo_list")],
+                [InlineKeyboardButton("Список пользователей", callback_data="admin_users")],
                 [InlineKeyboardButton("Назад", callback_data="main_menu")],
             ])
+        )
+        return WAITING_ADMIN
+
+    if data == "admin_users":
+        if user_id not in ADMIN_IDS:
+            return WAITING_MENU
+        rows = db_get_all_users()
+        if not rows:
+            text = "*Пользователей нет*"
+        else:
+            lines = ["*Пользователи* (топ 20 по тратам)" + chr(10)]
+            for uid, uname, atts, spent in rows[:20]:
+                lines.append(
+                    "ID: `" + str(uid) + "` | " + (uname or "?") +
+                    " | попыток: " + str(atts) +
+                    " | $" + str(round(spent, 2))
+                )
+            text = chr(10).join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "..."
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="admin")]])
         )
         return WAITING_ADMIN
 
@@ -640,9 +692,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "*Рассылка*" + chr(10) + chr(10) + "Напишите текст рассылки:",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
         )
         return WAITING_ADMIN_BROADCAST
 
@@ -653,9 +703,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "*Добавить баланс*" + chr(10) + chr(10) + "Введите Telegram ID пользователя:",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
         )
         return WAITING_ADMIN_ADD_BALANCE
 
@@ -668,30 +716,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Формат: `КОД ПОПЫТКИ ИСПОЛЬЗОВАНИЙ`" + chr(10) + chr(10) +
             "Примеры:" + chr(10) +
             "`SUMMER 5 10` - 5 попыток, 10 раз" + chr(10) +
-            "`VIP 25 1` - 25 попыток, 1 раз",
+            "`VIP 25 1` - 25 попыток, 1 раз" + chr(10) +
+            "`FREE 1 100` - 1 попытка, 100 раз",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="admin")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
         )
         return WAITING_ADMIN_CREATE_PROMO
 
     if data == "admin_promo_list":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
-        if not promo_codes:
+        rows = db_get_all_promos()
+        if not rows:
             text = "*Промокодов нет*"
         else:
             lines = ["*Список промокодов*" + chr(10)]
-            for c, v in promo_codes.items():
-                lines.append("`" + c + "` - " + str(v["attempts"]) + " поп. | " + str(v["uses"]) + "/" + str(v["max_uses"]))
+            for code, atts, uses, max_uses in rows:
+                lines.append("`" + code + "` - " + str(atts) + " поп. | " + str(uses) + "/" + str(max_uses))
             text = chr(10).join(lines)
         await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад", callback_data="admin")]
-            ])
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="admin")]])
         )
         return WAITING_ADMIN
 
@@ -701,66 +746,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
+    tg = update.effective_user
+    username = tg.username or tg.first_name or "Аноним"
     waiting = context.user_data.get("waiting")
 
-    # Промокод
     if waiting == "promo":
         context.user_data["waiting"] = None
         code_upper = text.upper()
-        if code_upper not in promo_codes:
+        ok, msg, atts = db_use_promo(user_id, code_upper)
+        if ok:
+            db_upsert_user(user_id, username, attempts_delta=atts)
+            new_attempts = db_get_attempts(user_id)
             await update.message.reply_text(
-                "Промокод не найден!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Назад", callback_data="main_menu")]
-                ])
+                "*Промокод активирован!*" + chr(10) + chr(10) +
+                "Начислено: *" + str(atts) + "* попыток" + chr(10) +
+                "Всего: *" + str(new_attempts) + "* попыток",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В меню", callback_data="main_menu")]])
             )
-            return WAITING_MENU
-        promo = promo_codes[code_upper]
-        if promo["uses"] >= promo["max_uses"]:
-            await update.message.reply_text("Промокод уже использован!")
-            return WAITING_MENU
-        if user_id not in used_promos:
-            used_promos[user_id] = set()
-        if code_upper in used_promos[user_id]:
-            await update.message.reply_text("Вы уже использовали этот промокод!")
-            return WAITING_MENU
-        promo["uses"] += 1
-        used_promos[user_id].add(code_upper)
-        user_attempts[user_id] = user_attempts.get(user_id, 0) + promo["attempts"]
-        await update.message.reply_text(
-            "*Промокод активирован!*" + chr(10) + chr(10) +
-            "Начислено: *" + str(promo["attempts"]) + "* попыток" + chr(10) +
-            "Всего: *" + str(user_attempts[user_id]) + "* попыток",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("В меню", callback_data="main_menu")]
-            ])
-        )
+        else:
+            await update.message.reply_text(
+                msg,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
+            )
         return WAITING_MENU
 
-    # Рассылка
     if waiting == "broadcast" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
+        rows = db_get_all_users()
         sent = 0
         failed = 0
-        for uid in list(user_names.keys()):
+        for row in rows:
             try:
-                await update.get_bot().send_message(chat_id=uid, text=text, parse_mode="Markdown")
+                await update.get_bot().send_message(chat_id=row[0], text=text, parse_mode="Markdown")
                 sent += 1
             except Exception:
                 failed += 1
         await update.message.reply_text(
-            "*Рассылка завершена*" + chr(10) +
-            "Отправлено: " + str(sent) + chr(10) +
-            "Ошибок: " + str(failed),
+            "*Рассылка завершена*" + chr(10) + "Отправлено: " + str(sent) + chr(10) + "Ошибок: " + str(failed),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("В админку", callback_data="admin")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В админку", callback_data="admin")]])
         )
         return WAITING_ADMIN
 
-    # Добавить баланс — ID
     if waiting == "add_balance_id" and user_id in ADMIN_IDS:
         try:
             target_id = int(text)
@@ -769,36 +797,34 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "ID: *" + str(target_id) + "*" + chr(10) + chr(10) + "Введите количество попыток:",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Отмена", callback_data="admin")]
-                ])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
             )
             return WAITING_ADMIN_ADD_BALANCE_AMOUNT
         except ValueError:
-            await update.message.reply_text("Неверный ID! Введите число.")
+            await update.message.reply_text("Неверный ID!")
             return WAITING_ADMIN_ADD_BALANCE
 
-    # Добавить баланс — количество
     if waiting == "add_balance_amount" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         target_id = context.user_data.get("target_id")
         try:
             amount = int(text)
-            user_attempts[target_id] = user_attempts.get(target_id, 0) + amount
+            row = db_get_user(target_id)
+            target_name = row[0] if row else "Пользователь"
+            db_upsert_user(target_id, target_name, attempts_delta=amount)
+            new_atts = db_get_attempts(target_id)
             await update.message.reply_text(
                 "*Баланс пополнен!*" + chr(10) +
-                "ID: " + str(target_id) + chr(10) +
+                "ID: `" + str(target_id) + "`" + chr(10) +
                 "Добавлено: *" + str(amount) + "* попыток" + chr(10) +
-                "Итого: *" + str(user_attempts[target_id]) + "*",
+                "Итого: *" + str(new_atts) + "*",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("В админку", callback_data="admin")]
-                ])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В админку", callback_data="admin")]])
             )
             try:
                 await update.get_bot().send_message(
                     chat_id=target_id,
-                    text="Вам начислено *" + str(amount) + "* попыток! Всего: *" + str(user_attempts[target_id]) + "*",
+                    text="Вам начислено *" + str(amount) + "* попыток! Всего: *" + str(new_atts) + "*",
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -807,39 +833,33 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Неверное количество!")
         return WAITING_ADMIN
 
-    # Создать промокод
     if waiting == "create_promo" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         parts = text.strip().split()
-        if len(parts) < 1:
+        if not parts:
             await update.message.reply_text("Неверный формат! Пример: `SUMMER 5 10`", parse_mode="Markdown")
             context.user_data["waiting"] = "create_promo"
             return WAITING_ADMIN_CREATE_PROMO
         new_code = parts[0].upper()
         try:
-            attempts_count = int(parts[1]) if len(parts) > 1 else 1
+            atts = max(1, min(int(parts[1]) if len(parts) > 1 else 1, 1000))
         except Exception:
-            attempts_count = 1
+            atts = 1
         try:
-            max_uses = int(parts[2]) if len(parts) > 2 else 1
+            max_uses = max(1, min(int(parts[2]) if len(parts) > 2 else 1, 10000))
         except Exception:
             max_uses = 1
-        attempts_count = max(1, min(attempts_count, 1000))
-        max_uses = max(1, min(max_uses, 10000))
-        promo_codes[new_code] = {"attempts": attempts_count, "uses": 0, "max_uses": max_uses}
+        db_create_promo(new_code, atts, max_uses)
         await update.message.reply_text(
             "*Промокод создан!*" + chr(10) + chr(10) +
             "Код: `" + new_code + "`" + chr(10) +
-            "Попыток: *" + str(attempts_count) + "*" + chr(10) +
+            "Попыток: *" + str(atts) + "*" + chr(10) +
             "Использований: *" + str(max_uses) + "*",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("В админку", callback_data="admin")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В админку", callback_data="admin")]])
         )
         return WAITING_ADMIN
 
-    # Иначе — обрабатываем как cookie
     return await receive_cookie(update, context)
 
 
@@ -847,18 +867,18 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookie = update.message.text.strip()
     method = context.user_data.get("method")
     user_id = update.effective_user.id
+    tg = update.effective_user
+    username = tg.username or tg.first_name or "Аноним"
 
     if not method:
         await show_main_menu(update, context)
         return WAITING_MENU
 
-    attempts = user_attempts.get(user_id, 0)
+    attempts = db_get_attempts(user_id)
     if attempts <= 0:
         await update.message.reply_text(
-            "Нет попыток! Купите через меню.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Купить", callback_data="buy")]
-            ])
+            "Нет попыток!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Купить", callback_data="buy")]])
         )
         return WAITING_MENU
 
@@ -879,12 +899,14 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = r.json()
     method_name = "Camera" if method == "camera" else "ID"
-    user_attempts[user_id] -= 1
+
+    # Списываем попытку
+    db_upsert_user(user_id, username, attempts_delta=-1)
 
     await msg.edit_text(
         "Аккаунт: *" + user["name"] + "*" + chr(10) +
         "Метод: *" + method_name + "*" + chr(10) +
-        "Осталось попыток: *" + str(user_attempts[user_id]) + "*" + chr(10) + chr(10) +
+        "Осталось попыток: *" + str(db_get_attempts(user_id)) + "*" + chr(10) + chr(10) +
         "Жди 20-30 сек...",
         parse_mode="Markdown"
     )
@@ -893,14 +915,14 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
     if isinstance(result, str) and result.startswith("ERROR"):
-        user_attempts[user_id] += 1
-        err = result[7:150] if len(result) > 7 else "неизвестная"
+        db_upsert_user(user_id, username, attempts_delta=1)
+        err = result[7:200]
         await msg.edit_text(
             "Техническая ошибка - попытка возвращена!" + chr(10) + chr(10) +
             "Причина: " + err + chr(10) + chr(10) + "/start"
         )
     elif result == "NOT_CLICKED":
-        user_attempts[user_id] += 1
+        db_upsert_user(user_id, username, attempts_delta=1)
         await msg.edit_text("Кнопка не найдена - попытка возвращена!" + chr(10) + chr(10) + "/start")
     elif result and "withpersona.com" in result:
         await msg.edit_text(
@@ -909,13 +931,12 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(result)
     else:
-        user_attempts[user_id] += 1
+        db_upsert_user(user_id, username, attempts_delta=1)
         await msg.edit_text("Не удалось получить ссылку - попытка возвращена!" + chr(10) + chr(10) + "/start")
 
-    attempts_left = user_attempts.get(user_id, 0)
     await update.message.reply_text(
         "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
-        "Ваши попытки: *" + str(attempts_left) + "*" + chr(10) + chr(10) +
+        "Ваши попытки: *" + str(db_get_attempts(user_id)) + "*" + chr(10) + chr(10) +
         "Выберите действие:",
         parse_mode="Markdown",
         reply_markup=main_menu_kb(user_id)
@@ -929,49 +950,34 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    db_init()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAITING_RULES: [CallbackQueryHandler(handle_callback)],
-            WAITING_MENU: [CallbackQueryHandler(handle_callback)],
-            WAITING_COOKIE: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_BUY: [CallbackQueryHandler(handle_callback)],
-            WAITING_PAYMENT: [CallbackQueryHandler(handle_callback)],
-            WAITING_PROMO: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_ADMIN: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_ADMIN_BROADCAST: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_ADMIN_ADD_BALANCE: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_ADMIN_ADD_BALANCE_AMOUNT: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
-            WAITING_ADMIN_CREATE_PROMO: [
-                CallbackQueryHandler(handle_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
-            ],
+            WAITING_RULES:                  [CallbackQueryHandler(handle_callback)],
+            WAITING_MENU:                   [CallbackQueryHandler(handle_callback)],
+            WAITING_COOKIE:                 [CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+            WAITING_BUY:                    [CallbackQueryHandler(handle_callback)],
+            WAITING_PAYMENT:                [CallbackQueryHandler(handle_callback)],
+            WAITING_PROMO:                  [CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+            WAITING_ADMIN:                  [CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+            WAITING_ADMIN_BROADCAST:        [CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+            WAITING_ADMIN_ADD_BALANCE:      [CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+            WAITING_ADMIN_ADD_BALANCE_AMOUNT:[CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+            WAITING_ADMIN_CREATE_PROMO:     [CallbackQueryHandler(handle_callback),
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start", start),
-        ],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
         per_user=True,
         per_chat=True,
+        block=False,
     )
     app.add_handler(conv)
     print("Bot started!")
