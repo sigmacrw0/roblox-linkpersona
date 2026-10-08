@@ -270,9 +270,17 @@ RESET_TEXTS = [
 ]
 
 CONTINUE_TEXTS = [
+    # Основные — для 13+ и других подтверждений
+    "Continue", "Continue »", "Continue >",
+    # Другие языки
+    "Continuar", "Continuer", "Fortfahren",
+    "Continua", "Продолжить",
+    "Doorgaan", "Kontynuuj", "Devam",
+    "Lanjutkan", "Tiep tuc",
+    # Без Camera/ID — exclude их в вызове
     "Next", "Proceed", "OK", "Submit",
     "Suivant", "Weiter", "Avanti",
-    "Далее", "Вперёд", "Volgende", "Nastepny",
+    "Далее", "Вперёд", "Volgende",
 ]
 
 
@@ -327,6 +335,203 @@ def build_url(data):
             url += "&session-token=" + tok.group(1)
         return url
     return None
+
+
+def get_url_via_api(cookie, method):
+    """
+    Быстрый метод через прямой API запрос (как в консоли браузера).
+    Работает без Playwright, занимает ~2 секунды.
+    """
+    try:
+        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+        body = {
+            "generateLink": True,
+            "ageEstimation": True,
+            "parentVerification": False
+        }
+
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
+
+        # Шаг 1: Первый запрос без CSRF — получаем токен
+        r1 = s.post(url, json=body)
+        logging.info("API step1: %d", r1.status_code)
+
+        csrf = r1.headers.get("x-csrf-token")
+        logging.info("CSRF: %s", csrf)
+
+        if r1.status_code == 200:
+            return _extract_api_url(r1)
+
+        if not csrf:
+            return None
+
+        # Шаг 2: Повторяем с CSRF токеном
+        s.headers["x-csrf-token"] = csrf
+        r2 = s.post(url, json=body)
+        logging.info("API step2: %d %s", r2.status_code, r2.text[:200])
+
+        if r2.status_code == 200:
+            return _extract_api_url(r2)
+
+        return None
+
+    except Exception as e:
+        logging.error("API error: %s", e)
+        return None
+
+
+def _extract_api_url(response):
+    """Извлекаем ссылку из ответа API"""
+    try:
+        data = response.json()
+        logging.info("API response: %s", str(data)[:300])
+
+        # Ищем ссылку в разных полях
+        link = (
+            data.get("verificationUrl") or
+            data.get("redirectUrl") or
+            data.get("url") or
+            data.get("personaUrl") or
+            data.get("sessionUrl") or
+            data.get("inquiryUrl")
+        )
+
+        if link and "withpersona.com" in link:
+            return link
+
+        # Ищем inquiry-id и session-token
+        inq_id = data.get("inquiryId") or data.get("inquiry_id")
+        session_token = data.get("sessionToken") or data.get("session_token")
+
+        if inq_id:
+            url = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
+            if session_token:
+                url += "&session-token=" + str(session_token)
+            return url
+
+        # Рекурсивный поиск по всему JSON
+        def find_in_obj(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
+                        return v
+                    if isinstance(v, str) and "inq_" in v:
+                        pass
+                    result = find_in_obj(v)
+                    if result:
+                        return result
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = find_in_obj(item)
+                    if result:
+                        return result
+            return None
+
+        return find_in_obj(data)
+
+    except Exception as e:
+        logging.error("Extract error: %s", e)
+        return None
+
+
+
+def get_link_via_api(cookie, method):
+    """
+    Быстрый способ через прямой API запрос (как в консольном скрипте).
+    Не требует браузера. Работает без 2FA если cookie валидный.
+    """
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
+
+        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+        body = {
+            "generateLink": True,
+            "ageEstimation": True,
+            "parentVerification": False
+        }
+
+        # Шаг 1: Первый запрос без CSRF — получаем токен
+        r1 = s.post(url, json=body)
+        csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-CSRF-Token")
+        logging.info("API step1: %d csrf=%s", r1.status_code, csrf)
+
+        if r1.status_code == 200:
+            data = r1.json()
+            link = extract_link_from_api(data)
+            if link:
+                return link
+
+        # Шаг 2: Повтор с CSRF токеном
+        if csrf:
+            s.headers["x-csrf-token"] = csrf
+            r2 = s.post(url, json=body)
+            logging.info("API step2: %d", r2.status_code)
+            if r2.status_code == 200:
+                data = r2.json()
+                logging.info("API response: %s", str(data)[:300])
+                link = extract_link_from_api(data)
+                if link:
+                    return link
+
+        return None
+    except Exception as e:
+        logging.error("API error: %s", e)
+        return None
+
+
+def extract_link_from_api(data):
+    """Ищем ссылку в JSON ответе"""
+    if not isinstance(data, dict):
+        return None
+
+    # Прямые поля
+    for key in ["verificationUrl", "redirectUrl", "url", "link",
+                "personaUrl", "inquiryUrl", "sessionUrl"]:
+        val = data.get(key, "")
+        if val and "withpersona.com" in val:
+            return val
+
+    # Строим из inquiry-id если есть
+    inq_id = data.get("inquiryId") or data.get("inquiry_id") or data.get("sessionIdentifier")
+    session_token = data.get("sessionToken") or data.get("session_token")
+
+    if inq_id and inq_id.startswith("inq_"):
+        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+        if session_token:
+            link += "&session-token=" + session_token
+        return link
+
+    # Ищем рекурсивно
+    def find_deep(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
+                    return v
+                result = find_deep(v)
+                if result:
+                    return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = find_deep(item)
+                if result:
+                    return result
+        return None
+
+    return find_deep(data)
 
 
 def playwright_get_url(cookie, method):
@@ -912,7 +1117,18 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
+
+    # Сначала быстрый API метод (~2 сек)
+    result = await loop.run_in_executor(executor, get_url_via_api, cookie, method)
+    logging.info("API result: %s", result)
+
+    # Если API не сработал — используем Playwright (~30 сек)
+    if not result:
+        await msg.edit_text(
+            "API не ответил, открываю браузер..." + chr(10) +
+            "Жди до 30 сек...",
+        )
+        result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
     if isinstance(result, str) and result.startswith("ERROR"):
         db_upsert_user(user_id, username, attempts_delta=1)
