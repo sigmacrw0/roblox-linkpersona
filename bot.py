@@ -660,57 +660,62 @@ TWO_FA_JS = """
 
 def get_url_via_api_2fa(cookie, method):
     """
-    Быстрый API метод для аккаунтов с 2FA.
-    Точно повторяет JS-скрипт из консоли браузера:
-      1й запрос без CSRF → получаем x-csrf-token
-      2й запрос с CSRF → получаем ссылку
-    Занимает ~2-3 секунды, без браузера.
+    Делает до 150 попыток запустить верификацию.
+    Каждая попытка: 2 запроса (без CSRF → получаем токен → с CSRF → ссылка).
+    Каждая попытка использует новый прокси из пула.
+    Возвращает ссылку как только получит, или None если все 150 не сработали.
     """
-    try:
-        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
-        body_data = {
-            "generateLink": True,
-            "ageEstimation": True,
-            "parentVerification": False,
-        }
+    url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+    body_data = {
+        "generateLink": True,
+        "ageEstimation": True,
+        "parentVerification": False,
+    }
+    headers_base = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/json;charset=utf-8",
+        "Origin": "https://www.roblox.com",
+        "Referer": "https://www.roblox.com/my/account#!/info",
+    }
 
-        s = requests.Session()
-        s.cookies[".ROBLOSECURITY"] = cookie
-        s.proxies.update(get_proxy())
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-            "Content-Type": "application/json;charset=utf-8",
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account#!/info",
-        })
+    for attempt in range(150):
+        try:
+            s = requests.Session()
+            s.cookies[".ROBLOSECURITY"] = cookie
+            s.proxies.update(get_proxy())
+            s.headers.update(headers_base)
 
-        # Шаг 1: запрос без CSRF (как send(null) в JS)
-        r1 = s.post(url, json=body_data)
-        csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-        logging.info("2FA API 1st: status=%d csrf=%s", r1.status_code, csrf)
+            # Шаг 1: без CSRF → получаем токен
+            r1 = s.post(url, json=body_data, timeout=8)
+            csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
+            logging.info("2FA attempt %d/150 — 1st: status=%d csrf=%s", attempt + 1, r1.status_code, bool(csrf))
 
-        if r1.status_code == 200:
-            link = _extract_api_url(r1)
-            if link:
-                return link
+            if r1.status_code == 200:
+                link = _extract_api_url(r1)
+                if link:
+                    logging.info("2FA: got link on attempt %d (step1)", attempt + 1)
+                    return link
 
-        if not csrf:
-            logging.warning("2FA API: no CSRF token received")
-            return None
+            if not csrf:
+                continue
 
-        # Шаг 2: запрос с CSRF (как send(csrf) в JS)
-        s.headers["x-csrf-token"] = csrf
-        r2 = s.post(url, json=body_data)
-        logging.info("2FA API 2nd: status=%d body=%s", r2.status_code, r2.text[:300])
+            # Шаг 2: с CSRF → ссылка
+            s.headers["x-csrf-token"] = csrf
+            r2 = s.post(url, json=body_data, timeout=8)
+            logging.info("2FA attempt %d/150 — 2nd: status=%d", attempt + 1, r2.status_code)
 
-        if r2.status_code == 200:
-            return _extract_api_url(r2)
+            if r2.status_code == 200:
+                link = _extract_api_url(r2)
+                if link:
+                    logging.info("2FA: got link on attempt %d (step2)", attempt + 1)
+                    return link
 
-        return None
+        except Exception as e:
+            logging.warning("2FA attempt %d error: %s", attempt + 1, e)
+            continue
 
-    except Exception as e:
-        logging.error("2FA API error: %s", e)
-        return "ERROR: " + str(e)
+    logging.error("2FA: all 150 attempts exhausted, no link")
+    return None
 
 
 def _extract_api_url(response):
