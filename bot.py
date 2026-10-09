@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
+LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")  # ID канала для логов
 
 # 20 потоков для одновременной работы
 executor = ThreadPoolExecutor(max_workers=20)
@@ -635,6 +636,51 @@ def check_invoice(invoice_id):
         return None
 
 
+# ===== ЛОГИ =====
+
+import time as _time
+
+async def send_log(bot, user_id, username, method, result, elapsed_sec, success):
+    """Отправляем лог в канал"""
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        if success:
+            header = "✅ УСПЕШНО"
+            service = "Ссылка Camera (Лицо)" if method == "camera" else "Ссылка ID (Паспорт)"
+            result_text = "Ссылка получена"
+            cost = "$0.20"
+        else:
+            header = "❌ НЕУДАЧА"
+            service = "Ссылка Camera (Лицо)" if method == "camera" else "Ссылка ID (Паспорт)"
+            result_text = str(result)[:50] if result else "Не получена"
+            cost = "$0.20"
+
+        uname_part = ("@" + username) if (username and not username.isdigit()) else ""
+
+        msg = (
+            "✅ " + header + chr(10) +
+            "━━━━━━━━━━━━━━━━━━━━━━" + chr(10) +
+            "👤 ID: " + str(user_id) +
+            (" | " + uname_part if uname_part else "") + chr(10) +
+            "⚙️ Услуга: " + service + chr(10) +
+            "✅ Результат: " + result_text + chr(10) +
+            "⏲️ Время: " + str(round(elapsed_sec)) + " сек" + chr(10) +
+            "💳 Сумма: " + cost
+        )
+
+        if not success:
+            msg = msg.replace("✅ " + header, "❌ " + header)
+            msg = msg.replace("✅ Результат:", "❌ Результат:")
+
+        await bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=msg
+        )
+    except Exception as e:
+        logging.error("Log channel error: %s", e)
+
+
 # ===== КЛАВИАТУРЫ =====
 
 def main_menu_kb(user_id=None):
@@ -1130,6 +1176,8 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
+    elapsed = round(_time.time() - _start_time)
+
     if isinstance(result, str) and result.startswith("ERROR"):
         db_upsert_user(user_id, username, attempts_delta=1)
         err = result[7:200]
@@ -1137,18 +1185,22 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Техническая ошибка - попытка возвращена!" + chr(10) + chr(10) +
             "Причина: " + err + chr(10) + chr(10) + "/start"
         )
+        await send_log(update.get_bot(), user_id, username, method, "Техническая ошибка", elapsed, False)
     elif result == "NOT_CLICKED":
         db_upsert_user(user_id, username, attempts_delta=1)
         await msg.edit_text("Кнопка не найдена - попытка возвращена!" + chr(10) + chr(10) + "/start")
+        await send_log(update.get_bot(), user_id, username, method, "Кнопка не найдена", elapsed, False)
     elif result and "withpersona.com" in result:
         await msg.edit_text(
             "*Ссылка получена!*" + chr(10) + chr(10) + "Используй сразу - одноразовая!",
             parse_mode="Markdown"
         )
         await update.message.reply_text(result)
+        await send_log(update.get_bot(), user_id, username, method, "Ссылка получена", elapsed, True)
     else:
         db_upsert_user(user_id, username, attempts_delta=1)
         await msg.edit_text("Не удалось получить ссылку - попытка возвращена!" + chr(10) + chr(10) + "/start")
+        await send_log(update.get_bot(), user_id, username, method, "Не удалось получить ссылку", elapsed, False)
 
     await update.message.reply_text(
         "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
