@@ -658,58 +658,69 @@ TWO_FA_JS = """
 """
 
 
+def _2fa_single_attempt(cookie, attempt_num):
+    """Один полный цикл: без CSRF → токен → с CSRF → ссылка. Возвращает ссылку или None."""
+    url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+    body_data = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.proxies.update(get_proxy())
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
+
+        r1 = s.post(url, json=body_data, timeout=8)
+        csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
+        logging.info("2FA #%d 1st: %d csrf=%s", attempt_num, r1.status_code, bool(csrf))
+
+        if r1.status_code == 200:
+            link = _extract_api_url(r1)
+            if link:
+                return link
+
+        if not csrf:
+            return None
+
+        s.headers["x-csrf-token"] = csrf
+        r2 = s.post(url, json=body_data, timeout=8)
+        logging.info("2FA #%d 2nd: %d", attempt_num, r2.status_code)
+
+        if r2.status_code == 200:
+            return _extract_api_url(r2)
+
+    except Exception as e:
+        logging.warning("2FA #%d error: %s", attempt_num, e)
+    return None
+
+
 def get_url_via_api_2fa(cookie, method):
     """
-    2-3 быстрых запроса за ~3 секунды, без браузера.
-    Каждая попытка: без CSRF → получаем токен → с CSRF → ссылка.
+    Запускает 75 настоящих HTTP запросов ОДНОВРЕМЕННО.
+    Как только первый вернул ссылку — возвращаем её сразу.
     """
-    url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
-    body_data = {
-        "generateLink": True,
-        "ageEstimation": True,
-        "parentVerification": False,
-    }
-    headers_base = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json;charset=utf-8",
-        "Origin": "https://www.roblox.com",
-        "Referer": "https://www.roblox.com/my/account#!/info",
-    }
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for attempt in range(150):
-        try:
-            s = requests.Session()
-            s.cookies[".ROBLOSECURITY"] = cookie
-            s.proxies.update(get_proxy())
-            s.headers.update(headers_base.copy())
+    TOTAL = 75
 
-            # Шаг 1: без CSRF → получаем токен
-            r1 = s.post(url, json=body_data, timeout=8)
-            csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-            logging.info("2FA #%d/150 1st: %d csrf=%s", attempt + 1, r1.status_code, bool(csrf))
-
-            if r1.status_code == 200:
-                link = _extract_api_url(r1)
+    with ThreadPoolExecutor(max_workers=TOTAL) as pool:
+        futures = [
+            pool.submit(_2fa_single_attempt, cookie, i + 1)
+            for i in range(TOTAL)
+        ]
+        for future in as_completed(futures):
+            try:
+                link = future.result()
                 if link:
+                    logging.info("2FA: got link")
                     return link
+            except Exception:
+                pass
 
-            if not csrf:
-                continue
-
-            # Шаг 2: с CSRF → ссылка
-            s.headers["x-csrf-token"] = csrf
-            r2 = s.post(url, json=body_data, timeout=8)
-            logging.info("2FA #%d/150 2nd: %d", attempt + 1, r2.status_code)
-
-            if r2.status_code == 200:
-                link = _extract_api_url(r2)
-                if link:
-                    return link
-
-        except Exception as e:
-            logging.warning("2FA #%d error: %s", attempt + 1, e)
-            continue
-
+    logging.error("2FA: all 75 requests failed")
     return None
 
 
