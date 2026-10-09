@@ -54,7 +54,8 @@ def db_init():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             attempts INTEGER DEFAULT 0,
-            spent REAL DEFAULT 0.0
+            spent REAL DEFAULT 0.0,
+            lang TEXT DEFAULT 'ru'
         )
     """)
     c.execute("""
@@ -179,6 +180,188 @@ def db_get_all_promos():
     rows = c.fetchall()
     conn.close()
     return rows
+
+def db_get_lang(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else "ru"
+
+def db_set_lang(user_id, lang):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, user_id))
+    conn.commit()
+    conn.close()
+
+
+# ===== ТЕКСТЫ =====
+
+TEXTS = {
+    "ru": {
+        "main_menu_title": "*Roblox Age Verification Bot*",
+        "main_menu_sub": "Сервис для получения ссылки by @dedbed12",
+        "main_menu_attempts": "Ваши попытки: *{attempts}*",
+        "main_menu_action": "Выберите действие ниже:",
+        "btn_get_link": "Получить ссылку",
+        "btn_buy": "Купить попытки",
+        "btn_promo": "Промокод",
+        "btn_top": "Топ пользователей",
+        "btn_help": "Помощь",
+        "btn_support": "Саппорт",
+        "btn_admin": "Админ панель",
+        "btn_back": "Назад",
+        "btn_cancel": "Отмена",
+        "btn_to_admin": "В админку",
+        "btn_buy_1": "1 попытка - $0.20",
+        "btn_buy_5": "5 попыток - $0.95 (5%)",
+        "btn_buy_10": "10 попыток - $1.80 (10%)",
+        "btn_buy_25": "25 попыток - $4.25 (15%)",
+        "help_text": (
+            "*Помощь*\n\n"
+            "*Как пользоваться:*\n"
+            "1. Купите попытки\n"
+            "2. Нажмите Получить ссылку\n"
+            "3. Отправьте `.ROBLOSECURITY` cookie\n"
+            "4. Выберите Camera или ID\n"
+            "5. Получите ссылку на верификацию\n\n"
+            "*Важно:*\n"
+            "- При технической ошибке попытка возвращается\n"
+            "- При невалидном cookie попытка возвращается\n"
+            "- Переведите страницу на English и нажмите кнопку Reset\n"
+            "- Владелец не несёт ответственности за поломку cookie"
+        ),
+        "top_title": "*Топ пользователей*\n",
+        "top_empty": "Пока никто не совершил покупок.",
+        "buy_title": "*Покупка попыток*",
+        "buy_price": "Цена: *$0.20* за попытку",
+        "buy_discount": "Скидки: 5 шт -5%, 10 шт -10%, 25 шт -15%",
+        "promo_title": "*Активация промокода*",
+        "promo_enter": "Введите промокод:",
+        "promo_ok": "Промокод активирован! +*{attempts}* попыток\nВсего: *{total}*",
+        "promo_not_found": "Промокод не найден!",
+        "promo_used": "Промокод уже использован!",
+        "promo_used_by_you": "Вы уже использовали этот промокод!",
+        "no_attempts": "Нет попыток!",
+        "btn_buy_short": "Купить",
+        "checking_cookie": "Проверяю cookie...",
+        "invalid_cookie": "Неверный cookie! Попробуй снова.\n\n/start",
+        "processing": "Аккаунт: *{name}*\nМетод: *{method}*\nОсталось попыток: *{attempts}*\n\nЖди 20-30 сек...",
+        "browser_fallback": "API не ответил, открываю браузер...\nЖди до 30 сек...",
+        "error_returned": "Техническая ошибка - попытка возвращена!\n\nПричина: {reason}\n\n/start",
+        "not_clicked_returned": "Кнопка не найдена - попытка возвращена!\n\n/start",
+        "link_received": "*Ссылка получена!*\n\nИспользуй сразу - одноразовая!",
+        "failed_returned": "❌ Не удалось получить ссылку — попытка возвращена!",
+        "method_camera": "Camera",
+        "method_id": "ID",
+        "service_camera": "Ссылка Camera (Лицо)",
+        "service_id": "Ссылка ID (Паспорт)",
+        "log_success": "✅ УСПЕШНО",
+        "log_fail": "❌ НЕУДАЧА",
+        "log_result_ok": "Ссылка получена",
+        "log_result_fail": "Не удалось получить ссылку",
+        "anon": "Аноним",
+        "choose_method": "*Выберите метод верификации:*",
+        "btn_camera": "📷 Camera (Лицо)",
+        "btn_id": "🪪 ID (Паспорт)",
+        "invoice_created": "*Счёт создан!*\n\nСумма: *${amount}*\nПопыток: *{attempts}*\n\nОплати и нажми Проверить оплату:",
+        "btn_check_pay": "✅ Проверить оплату",
+        "btn_pay": "💳 Оплатить",
+        "pay_ok": "*Оплата получена!*\nНачислено *{attempts}* попыток\nВсего: *{total}*",
+        "pay_pending": "Оплата ещё не получена. Попробуй позже.",
+        "pay_error": "Ошибка создания счёта!",
+        "lang_choose": "🌐 Выберите язык / Choose language:",
+        "lang_set": "✅ Язык установлен: Русский",
+        "cancelled": "Отменено. /start",
+    },
+    "en": {
+        "main_menu_title": "*Roblox Age Verification Bot*",
+        "main_menu_sub": "Service for getting verification link by @dedbed12",
+        "main_menu_attempts": "Your attempts: *{attempts}*",
+        "main_menu_action": "Choose an action below:",
+        "btn_get_link": "Get link",
+        "btn_buy": "Buy attempts",
+        "btn_promo": "Promo code",
+        "btn_top": "Top users",
+        "btn_help": "Help",
+        "btn_support": "Support",
+        "btn_admin": "Admin panel",
+        "btn_back": "Back",
+        "btn_cancel": "Cancel",
+        "btn_to_admin": "To admin",
+        "btn_buy_1": "1 attempt - $0.20",
+        "btn_buy_5": "5 attempts - $0.95 (5%)",
+        "btn_buy_10": "10 attempts - $1.80 (10%)",
+        "btn_buy_25": "25 attempts - $4.25 (15%)",
+        "help_text": (
+            "*Help*\n\n"
+            "*How to use:*\n"
+            "1. Buy attempts\n"
+            "2. Press Get link\n"
+            "3. Send your `.ROBLOSECURITY` cookie\n"
+            "4. Choose Camera or ID\n"
+            "5. Get the verification link\n\n"
+            "*Important:*\n"
+            "- Attempt is returned on technical error\n"
+            "- Attempt is returned on invalid cookie\n"
+            "- Translate the page to English and click Reset\n"
+            "- Owner is not responsible for cookie damage"
+        ),
+        "top_title": "*Top users*\n",
+        "top_empty": "No purchases yet.",
+        "buy_title": "*Buy attempts*",
+        "buy_price": "Price: *$0.20* per attempt",
+        "buy_discount": "Discounts: 5 pcs -5%, 10 pcs -10%, 25 pcs -15%",
+        "promo_title": "*Promo code activation*",
+        "promo_enter": "Enter promo code:",
+        "promo_ok": "Promo activated! +*{attempts}* attempts\nTotal: *{total}*",
+        "promo_not_found": "Promo code not found!",
+        "promo_used": "Promo code already used!",
+        "promo_used_by_you": "You have already used this promo code!",
+        "no_attempts": "No attempts left!",
+        "btn_buy_short": "Buy",
+        "checking_cookie": "Checking cookie...",
+        "invalid_cookie": "Invalid cookie! Try again.\n\n/start",
+        "processing": "Account: *{name}*\nMethod: *{method}*\nAttempts left: *{attempts}*\n\nPlease wait 20-30 sec...",
+        "browser_fallback": "API didn't respond, opening browser...\nWait up to 30 sec...",
+        "error_returned": "Technical error - attempt returned!\n\nReason: {reason}\n\n/start",
+        "not_clicked_returned": "Button not found - attempt returned!\n\n/start",
+        "link_received": "*Link received!*\n\nUse it immediately - one-time only!",
+        "failed_returned": "❌ Failed to get link — attempt returned!",
+        "method_camera": "Camera",
+        "method_id": "ID",
+        "service_camera": "Camera link (Face)",
+        "service_id": "ID link (Passport)",
+        "log_success": "✅ SUCCESS",
+        "log_fail": "❌ FAILURE",
+        "log_result_ok": "Link received",
+        "log_result_fail": "Failed to get link",
+        "anon": "Anonymous",
+        "choose_method": "*Choose verification method:*",
+        "btn_camera": "📷 Camera (Face)",
+        "btn_id": "🪪 ID (Passport)",
+        "invoice_created": "*Invoice created!*\n\nAmount: *${amount}*\nAttempts: *{attempts}*\n\nPay and press Check payment:",
+        "btn_check_pay": "✅ Check payment",
+        "btn_pay": "💳 Pay",
+        "pay_ok": "*Payment received!*\nAdded *{attempts}* attempts\nTotal: *{total}*",
+        "pay_pending": "Payment not received yet. Try later.",
+        "pay_error": "Invoice creation error!",
+        "lang_choose": "🌐 Выберите язык / Choose language:",
+        "lang_set": "✅ Language set: English",
+        "cancelled": "Cancelled. /start",
+    }
+}
+
+def t(user_id, key, **kwargs):
+    """Получить текст на языке пользователя"""
+    lang = db_get_lang(user_id)
+    text = TEXTS.get(lang, TEXTS["ru"]).get(key, TEXTS["ru"].get(key, key))
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
+
 
 # ===== PLAYWRIGHT =====
 
@@ -646,32 +829,29 @@ async def send_log(bot, user_id, username, method, result, elapsed_sec, success)
         return
     try:
         if success:
-            header = "✅ УСПЕШНО"
-            service = "Ссылка Camera (Лицо)" if method == "camera" else "Ссылка ID (Паспорт)"
-            result_text = "Ссылка получена"
+            header = t(user_id, "log_success")
+            service = t(user_id, "service_camera") if method == "camera" else t(user_id, "service_id")
+            result_text = t(user_id, "log_result_ok")
             cost = "$0.20"
         else:
-            header = "❌ НЕУДАЧА"
-            service = "Ссылка Camera (Лицо)" if method == "camera" else "Ссылка ID (Паспорт)"
-            result_text = str(result)[:50] if result else "Не получена"
+            header = t(user_id, "log_fail")
+            service = t(user_id, "service_camera") if method == "camera" else t(user_id, "service_id")
+            result_text = str(result)[:50] if result else t(user_id, "log_result_fail")
             cost = "$0.20"
 
         uname_part = ("@" + username) if (username and not username.isdigit()) else ""
+        result_icon = "✅" if success else "❌"
 
         msg = (
-            "✅ " + header + chr(10) +
+            header + chr(10) +
             "━━━━━━━━━━━━━━━━━━━━━━" + chr(10) +
             "👤 ID: " + str(user_id) +
             (" | " + uname_part if uname_part else "") + chr(10) +
             "⚙️ Услуга: " + service + chr(10) +
-            "✅ Результат: " + result_text + chr(10) +
+            result_icon + " Результат: " + result_text + chr(10) +
             "⏲️ Время: " + str(round(elapsed_sec)) + " сек" + chr(10) +
             "💳 Сумма: " + cost
         )
-
-        if not success:
-            msg = msg.replace("✅ " + header, "❌ " + header)
-            msg = msg.replace("✅ Результат:", "❌ Результат:")
 
         await bot.send_message(
             chat_id=LOG_CHANNEL_ID,
@@ -684,16 +864,18 @@ async def send_log(bot, user_id, username, method, result, elapsed_sec, success)
 # ===== КЛАВИАТУРЫ =====
 
 def main_menu_kb(user_id=None):
+    lang = db_get_lang(user_id) if user_id else "ru"
+    T = TEXTS[lang]
     buttons = [
-        [InlineKeyboardButton("Получить ссылку", callback_data="get_link")],
-        [InlineKeyboardButton("Купить попытки", callback_data="buy"),
-         InlineKeyboardButton("Промокод", callback_data="promo")],
-        [InlineKeyboardButton("Топ пользователей", callback_data="top")],
-        [InlineKeyboardButton("Помощь", callback_data="help"),
-         InlineKeyboardButton("Саппорт", url="https://t.me/dedbed12")],
+        [InlineKeyboardButton(T["btn_get_link"], callback_data="get_link")],
+        [InlineKeyboardButton(T["btn_buy"], callback_data="buy"),
+         InlineKeyboardButton(T["btn_promo"], callback_data="promo")],
+        [InlineKeyboardButton(T["btn_top"], callback_data="top")],
+        [InlineKeyboardButton(T["btn_help"], callback_data="help"),
+         InlineKeyboardButton(T["btn_support"], url="https://t.me/dedbed12")],
     ]
     if user_id and user_id in ADMIN_IDS:
-        buttons.append([InlineKeyboardButton("Админ панель", callback_data="admin")])
+        buttons.append([InlineKeyboardButton(T["btn_admin"], callback_data="admin")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -701,10 +883,10 @@ async def show_main_menu(update, context):
     user_id = update.effective_user.id
     attempts = db_get_attempts(user_id)
     text = (
-        "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
-        "Сервис для получения ссылки by @dedbed12" + chr(10) + chr(10) +
-        "Ваши попытки: *" + str(attempts) + "*" + chr(10) + chr(10) +
-        "Выберите действие ниже:"
+        t(user_id, "main_menu_title") + chr(10) + chr(10) +
+        t(user_id, "main_menu_sub") + chr(10) + chr(10) +
+        t(user_id, "main_menu_attempts", attempts=attempts) + chr(10) + chr(10) +
+        t(user_id, "main_menu_action")
     )
     kb = main_menu_kb(user_id)
     if update.callback_query:
@@ -732,66 +914,66 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = tg.username or tg.first_name or "Аноним"
     data = query.data
 
+    if data.startswith("set_lang_"):
+        lang = data.split("_")[2]
+        db_set_lang(user_id, lang)
+        await query.edit_message_text(
+            TEXTS[lang]["lang_set"],
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(TEXTS[lang]["btn_back"], callback_data="main_menu")
+            ]])
+        )
+        return WAITING_MENU
+
     if data in ["main_menu", "accept_rules"]:
         await show_main_menu(update, context)
         return WAITING_MENU
 
     if data == "help":
         await query.edit_message_text(
-            "*Помощь*" + chr(10) + chr(10) +
-            "*Как пользоваться:*" + chr(10) +
-            "1. Купите попытки" + chr(10) +
-            "2. Нажмите Получить ссылку" + chr(10) +
-            "3. Отправьте `.ROBLOSECURITY` cookie" + chr(10) +
-            "4. Выберите Camera или ID" + chr(10) +
-            "5. Получите ссылку на верификацию" + chr(10) + chr(10) +
-            "*Важно:*" + chr(10) +
-            "- При технической ошибке попытка возвращается" + chr(10) +
-            "- При невалидном cookie попытка возвращается" + chr(10) +
-            "- Переведите страницу на English и нажмите кнопку Reset" + chr(10) +
-            "- Владелец не несёт ответственности за поломку cookie",
+            t(user_id, "help_text"),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
         )
         return WAITING_MENU
 
     if data == "top":
         rows = db_get_top(10)
         medals = ["🥇", "🥈", "🥉"]
-        lines = ["*Топ пользователей*" + chr(10)]
+        lines = [t(user_id, "top_title")]
         if not rows:
-            lines.append("Пока никто не совершил покупок.")
+            lines.append(t(user_id, "top_empty"))
         else:
             for i, (uid, uname, spent) in enumerate(rows):
                 medal = medals[i] if i < 3 else str(i + 1) + "."
-                lines.append(medal + " " + (uname or "Аноним") + " - $" + str(round(spent, 2)))
+                lines.append(medal + " " + (uname or t(user_id, "anon")) + " - $" + str(round(spent, 2)))
         await query.edit_message_text(
             chr(10).join(lines), parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
         )
         return WAITING_MENU
 
     if data == "promo":
         context.user_data["waiting"] = "promo"
         await query.edit_message_text(
-            "*Активация промокода*" + chr(10) + chr(10) + "Введите промокод:",
+            t(user_id, "promo_title") + chr(10) + chr(10) + t(user_id, "promo_enter"),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
         )
         return WAITING_PROMO
 
     if data == "buy":
         await query.edit_message_text(
-            "*Покупка попыток*" + chr(10) + chr(10) +
-            "Цена: *$0.20* за попытку" + chr(10) + chr(10) +
-            "Скидки: 5 шт -5%, 10 шт -10%, 25 шт -15%",
+            t(user_id, "buy_title") + chr(10) + chr(10) +
+            t(user_id, "buy_price") + chr(10) + chr(10) +
+            t(user_id, "buy_discount"),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("1 попытка - $0.20", callback_data="buy_1")],
-                [InlineKeyboardButton("5 попыток - $0.95 (5%)", callback_data="buy_5")],
-                [InlineKeyboardButton("10 попыток - $1.80 (10%)", callback_data="buy_10")],
-                [InlineKeyboardButton("25 попыток - $4.25 (15%)", callback_data="buy_25")],
-                [InlineKeyboardButton("Назад", callback_data="main_menu")],
+                [InlineKeyboardButton(t(user_id, "btn_buy_1"), callback_data="buy_1")],
+                [InlineKeyboardButton(t(user_id, "btn_buy_5"), callback_data="buy_5")],
+                [InlineKeyboardButton(t(user_id, "btn_buy_10"), callback_data="buy_10")],
+                [InlineKeyboardButton(t(user_id, "btn_buy_25"), callback_data="buy_25")],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")],
             ])
         )
         return WAITING_BUY
@@ -804,24 +986,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         invoice = create_invoice(total, count)
         if not invoice:
             await query.edit_message_text(
-                "Ошибка создания инвойса. Попробуй позже.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="buy")]])
+                t(user_id, "pay_error"),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="buy")]])
             )
             return WAITING_MENU
         invoice_id = str(invoice["invoice_id"])
         pay_url = invoice["pay_url"]
         pending_payments[invoice_id] = {"user_id": user_id, "attempts": count, "total": total}
         await query.edit_message_text(
-            "*Оплата через CryptoBot*" + chr(10) + chr(10) +
-            "Инвойс: `" + invoice_id + "`" + chr(10) +
-            "Попыток: *" + str(count) + "*" + chr(10) +
-            "Сумма: *$" + str(total) + "*" + chr(10) + chr(10) +
-            "Оплата в USDT. После оплаты нажмите Я оплатил.",
+            t(user_id, "invoice_created", amount=total, attempts=count),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Оплатить", url=pay_url)],
-                [InlineKeyboardButton("Я оплатил", callback_data="check_" + invoice_id)],
-                [InlineKeyboardButton("Назад", callback_data="buy")],
+                [InlineKeyboardButton(t(user_id, "btn_pay"), url=pay_url)],
+                [InlineKeyboardButton(t(user_id, "btn_check_pay"), callback_data="check_" + invoice_id)],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="buy")],
             ])
         )
         return WAITING_PAYMENT
@@ -837,38 +1015,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_upsert_user(user_id, username, attempts_delta=cnt, spent_delta=total)
                 new_attempts = db_get_attempts(user_id)
                 await query.edit_message_text(
-                    "*Оплата подтверждена!*" + chr(10) + chr(10) +
-                    "Зачислено: *" + str(cnt) + "* попыток" + chr(10) +
-                    "Всего: *" + str(new_attempts) + "* попыток",
+                    t(user_id, "pay_ok", attempts=cnt, total=new_attempts),
                     parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В меню", callback_data="main_menu")]])
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
                 )
             else:
-                await query.answer("Уже обработано!", show_alert=True)
+                await query.answer("Already processed!" if db_get_lang(user_id) == "en" else "Уже обработано!", show_alert=True)
         else:
-            await query.answer("Оплата не найдена. Подожди и попробуй снова.", show_alert=True)
+            await query.answer(t(user_id, "pay_pending"), show_alert=True)
         return WAITING_MENU
 
     if data == "get_link":
         attempts = db_get_attempts(user_id)
         if attempts <= 0:
             await query.edit_message_text(
-                "*Нет попыток!*" + chr(10) + chr(10) + "Купите попытки чтобы продолжить.",
+                "*" + t(user_id, "no_attempts") + "*",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Купить попытки", callback_data="buy")],
-                    [InlineKeyboardButton("Назад", callback_data="main_menu")],
+                    [InlineKeyboardButton(t(user_id, "btn_buy"), callback_data="buy")],
+                    [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")],
                 ])
             )
             return WAITING_MENU
         await query.edit_message_text(
-            "*Получить ссылку*" + chr(10) + chr(10) +
-            "Попыток: *" + str(attempts) + "*" + chr(10) + chr(10) + "Выберите метод:",
+            t(user_id, "choose_method"),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Лицо (Camera)", callback_data="choose_camera")],
-                [InlineKeyboardButton("Паспорт (ID)", callback_data="choose_id")],
-                [InlineKeyboardButton("Назад", callback_data="main_menu")],
+                [InlineKeyboardButton(t(user_id, "btn_camera"), callback_data="choose_camera")],
+                [InlineKeyboardButton(t(user_id, "btn_id"), callback_data="choose_id")],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")],
             ])
         )
         return WAITING_MENU
@@ -876,10 +1051,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ["choose_camera", "choose_id"]:
         method = "camera" if data == "choose_camera" else "id"
         context.user_data["method"] = method
+        method_name = t(user_id, "method_camera") if method == "camera" else t(user_id, "method_id")
         await query.edit_message_text(
-            "Метод: *" + ("Camera" if method == "camera" else "ID") + "*" + chr(10) + chr(10) +
-            "Отправь `.ROBLOSECURITY` cookie" + chr(10) +
-            "Сообщение будет удалено автоматически",
+            "Method: *" + method_name + "*\n\nSend your `.ROBLOSECURITY` cookie\nMessage will be deleted automatically"
+            if db_get_lang(user_id) == "en" else
+            "Метод: *" + method_name + "*\n\nОтправь `.ROBLOSECURITY` cookie\nСообщение будет удалено автоматически",
             parse_mode="Markdown"
         )
         return WAITING_COOKIE
@@ -1004,21 +1180,26 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting == "promo":
         context.user_data["waiting"] = None
         code_upper = text.upper()
-        ok, msg, atts = db_use_promo(user_id, code_upper)
+        ok, msg_key, atts = db_use_promo(user_id, code_upper)
         if ok:
             db_upsert_user(user_id, username, attempts_delta=atts)
             new_attempts = db_get_attempts(user_id)
             await update.message.reply_text(
-                "*Промокод активирован!*" + chr(10) + chr(10) +
-                "Начислено: *" + str(atts) + "* попыток" + chr(10) +
-                "Всего: *" + str(new_attempts) + "* попыток",
+                t(user_id, "promo_ok", attempts=atts, total=new_attempts),
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В меню", callback_data="main_menu")]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
             )
         else:
+            # msg_key is one of: "Промокод не найден!", "Промокод уже использован!", "Вы уже использовали этот промокод!"
+            if "не найден" in msg_key or "not found" in msg_key:
+                reply_msg = t(user_id, "promo_not_found")
+            elif "уже использован" in msg_key and "Вы" not in msg_key:
+                reply_msg = t(user_id, "promo_used")
+            else:
+                reply_msg = t(user_id, "promo_used_by_you")
             await update.message.reply_text(
-                msg,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
+                reply_msg,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
             )
         return WAITING_MENU
 
@@ -1128,8 +1309,8 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attempts = db_get_attempts(user_id)
     if attempts <= 0:
         await update.message.reply_text(
-            "Нет попыток!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Купить", callback_data="buy")]])
+            t(user_id, "no_attempts"),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_buy_short"), callback_data="buy")]])
         )
         return WAITING_MENU
 
@@ -1138,27 +1319,24 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    msg = await update.message.reply_text("Проверяю cookie...")
+    msg = await update.message.reply_text(t(user_id, "checking_cookie"))
 
     s = requests.Session()
     s.cookies[".ROBLOSECURITY"] = cookie
     r = s.get("https://users.roblox.com/v1/users/authenticated")
 
     if r.status_code != 200:
-        await msg.edit_text("Неверный cookie! Попробуй снова." + chr(10) + chr(10) + "/start")
+        await msg.edit_text(t(user_id, "invalid_cookie"))
         return WAITING_MENU
 
     user = r.json()
-    method_name = "Camera" if method == "camera" else "ID"
+    method_name = t(user_id, "method_camera") if method == "camera" else t(user_id, "method_id")
 
     # Списываем попытку
     db_upsert_user(user_id, username, attempts_delta=-1)
 
     await msg.edit_text(
-        "Аккаунт: *" + user["name"] + "*" + chr(10) +
-        "Метод: *" + method_name + "*" + chr(10) +
-        "Осталось попыток: *" + str(db_get_attempts(user_id)) + "*" + chr(10) + chr(10) +
-        "Жди 20-30 сек...",
+        t(user_id, "processing", name=user["name"], method=method_name, attempts=db_get_attempts(user_id)),
         parse_mode="Markdown"
     )
 
@@ -1171,10 +1349,7 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Если API не сработал — используем Playwright (~30 сек)
     if not result:
-        await msg.edit_text(
-            "API не ответил, открываю браузер..." + chr(10) +
-            "Жди до 30 сек...",
-        )
+        await msg.edit_text(t(user_id, "browser_fallback"))
         result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
 
     elapsed = round(_time.time() - _start_time)
@@ -1182,39 +1357,46 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(result, str) and result.startswith("ERROR"):
         db_upsert_user(user_id, username, attempts_delta=1)
         err = result[7:200]
-        await msg.edit_text(
-            "Техническая ошибка - попытка возвращена!" + chr(10) + chr(10) +
-            "Причина: " + err + chr(10) + chr(10) + "/start"
-        )
-        await send_log(update.get_bot(), user_id, username, method, "Техническая ошибка", elapsed, False)
+        await msg.edit_text(t(user_id, "error_returned", reason=err))
+        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
     elif result == "NOT_CLICKED":
         db_upsert_user(user_id, username, attempts_delta=1)
-        await msg.edit_text("Кнопка не найдена - попытка возвращена!" + chr(10) + chr(10) + "/start")
-        await send_log(update.get_bot(), user_id, username, method, "Кнопка не найдена", elapsed, False)
+        await msg.edit_text(t(user_id, "not_clicked_returned"))
+        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
     elif result and "withpersona.com" in result:
-        await msg.edit_text(
-            "*Ссылка получена!*" + chr(10) + chr(10) + "Используй сразу - одноразовая!",
-            parse_mode="Markdown"
-        )
+        await msg.edit_text(t(user_id, "link_received"), parse_mode="Markdown")
         await update.message.reply_text(result)
-        await send_log(update.get_bot(), user_id, username, method, "Ссылка получена", elapsed, True)
+        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_ok"), elapsed, True)
     else:
         db_upsert_user(user_id, username, attempts_delta=1)
-        await msg.edit_text("Не удалось получить ссылку - попытка возвращена!" + chr(10) + chr(10) + "/start")
-        await send_log(update.get_bot(), user_id, username, method, "Не удалось получить ссылку", elapsed, False)
+        await msg.edit_text(t(user_id, "failed_returned"))
+        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
 
     await update.message.reply_text(
-        "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
-        "Ваши попытки: *" + str(db_get_attempts(user_id)) + "*" + chr(10) + chr(10) +
-        "Выберите действие:",
+        t(user_id, "main_menu_title") + chr(10) + chr(10) +
+        t(user_id, "main_menu_attempts", attempts=db_get_attempts(user_id)) + chr(10) + chr(10) +
+        t(user_id, "main_menu_action"),
         parse_mode="Markdown",
         reply_markup=main_menu_kb(user_id)
     )
     return WAITING_MENU
 
 
+async def lan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        TEXTS["ru"]["lang_choose"],
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🇷🇺 Русский", callback_data="set_lang_ru"),
+             InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en")]
+        ])
+    )
+    return WAITING_MENU
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено. /start")
+    user_id = update.effective_user.id
+    await update.message.reply_text(t(user_id, "cancelled"))
     return ConversationHandler.END
 
 
@@ -1222,7 +1404,7 @@ def main():
     db_init()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", start), CommandHandler("lan", lan_command)],
         states={
             WAITING_RULES:                  [CallbackQueryHandler(handle_callback)],
             WAITING_MENU:                   [CallbackQueryHandler(handle_callback)],
@@ -1243,7 +1425,7 @@ def main():
             WAITING_ADMIN_CREATE_PROMO:     [CallbackQueryHandler(handle_callback),
                                              MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start), CommandHandler("lan", lan_command)],
         per_user=True,
         per_chat=True,
         block=False,
