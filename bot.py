@@ -676,7 +676,7 @@ def get_url_via_api_2fa(cookie, method):
         "Referer": "https://www.roblox.com/my/account#!/info",
     }
 
-    for attempt in range(3):
+    for attempt in range(150):
         try:
             s = requests.Session()
             s.cookies[".ROBLOSECURITY"] = cookie
@@ -684,9 +684,9 @@ def get_url_via_api_2fa(cookie, method):
             s.headers.update(headers_base.copy())
 
             # Шаг 1: без CSRF → получаем токен
-            r1 = s.post(url, json=body_data, timeout=3)
+            r1 = s.post(url, json=body_data, timeout=8)
             csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-            logging.info("2FA #%d 1st: %d csrf=%s", attempt + 1, r1.status_code, bool(csrf))
+            logging.info("2FA #%d/150 1st: %d csrf=%s", attempt + 1, r1.status_code, bool(csrf))
 
             if r1.status_code == 200:
                 link = _extract_api_url(r1)
@@ -698,8 +698,8 @@ def get_url_via_api_2fa(cookie, method):
 
             # Шаг 2: с CSRF → ссылка
             s.headers["x-csrf-token"] = csrf
-            r2 = s.post(url, json=body_data, timeout=3)
-            logging.info("2FA #%d 2nd: %d", attempt + 1, r2.status_code)
+            r2 = s.post(url, json=body_data, timeout=8)
+            logging.info("2FA #%d/150 2nd: %d", attempt + 1, r2.status_code)
 
             if r2.status_code == 200:
                 link = _extract_api_url(r2)
