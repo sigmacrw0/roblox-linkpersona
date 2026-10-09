@@ -1554,33 +1554,55 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elapsed = round(_time.time() - _start_time)
 
-    if isinstance(result, str) and result.startswith("ERROR"):
-        db_upsert_user(user_id, username, attempts_delta=1)
-        err = result[7:200]
-        await msg.edit_text(t(user_id, "error_returned", reason=err))
-        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
-    elif result == "NOT_CLICKED":
-        db_upsert_user(user_id, username, attempts_delta=1)
-        await msg.edit_text(t(user_id, "not_clicked_returned"))
-        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
-    elif result and "withpersona.com" in result:
+    if result and "withpersona.com" in result:
+        # Успех
         await msg.edit_text(t(user_id, "link_received"), parse_mode="Markdown")
         await update.message.reply_text(result)
         await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_ok"), elapsed, True)
-    else:
-        db_upsert_user(user_id, username, attempts_delta=1)
-        await msg.edit_text(t(user_id, "failed_returned"))
-        await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
+        context.user_data["has_2fa"] = False
+        await update.message.reply_text(
+            t(user_id, "main_menu_title") + chr(10) + chr(10) +
+            t(user_id, "main_menu_attempts", attempts=db_get_attempts(user_id)) + chr(10) + chr(10) +
+            t(user_id, "main_menu_action"),
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb(user_id)
+        )
+        return WAITING_MENU
 
-    context.user_data["has_2fa"] = False
-    await update.message.reply_text(
-        t(user_id, "main_menu_title") + chr(10) + chr(10) +
-        t(user_id, "main_menu_attempts", attempts=db_get_attempts(user_id)) + chr(10) + chr(10) +
-        t(user_id, "main_menu_action"),
-        parse_mode="Markdown",
-        reply_markup=main_menu_kb(user_id)
-    )
-    return WAITING_MENU
+    # Неудача — возвращаем попытку
+    db_upsert_user(user_id, username, attempts_delta=1)
+    await send_log(update.get_bot(), user_id, username, method, t(user_id, "log_result_fail"), elapsed, False)
+
+    if has_2fa:
+        # Для 2FA: сразу снова запрашиваем cookie, не уходим в меню
+        method_name = t(user_id, "method_camera") if method == "camera" else t(user_id, "method_id")
+        retry_text = (
+            "❌ Не удалось — попытка возвращена!\n\n"
+            "Метод: *{method}*\n\nОтправь cookie снова:"
+            if db_get_lang(user_id) == "ru" else
+            "❌ Failed — attempt returned!\n\n"
+            "Method: *{method}*\n\nSend cookie again:"
+        ).format(method=method_name)
+        await msg.edit_text(retry_text, parse_mode="Markdown")
+        # has_2fa и method остаются в context.user_data — сразу ждём cookie
+        return WAITING_COOKIE
+    else:
+        if isinstance(result, str) and result.startswith("ERROR"):
+            err = result[7:200]
+            await msg.edit_text(t(user_id, "error_returned", reason=err))
+        elif result == "NOT_CLICKED":
+            await msg.edit_text(t(user_id, "not_clicked_returned"))
+        else:
+            await msg.edit_text(t(user_id, "failed_returned"))
+
+        await update.message.reply_text(
+            t(user_id, "main_menu_title") + chr(10) + chr(10) +
+            t(user_id, "main_menu_attempts", attempts=db_get_attempts(user_id)) + chr(10) + chr(10) +
+            t(user_id, "main_menu_action"),
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb(user_id)
+        )
+        return WAITING_MENU
 
 
 async def lan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
