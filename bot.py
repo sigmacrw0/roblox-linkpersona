@@ -292,7 +292,7 @@ TEXTS = {
         "browser_fallback": "API не ответил, открываю браузер...\nЖди до 30 сек...",
         "error_returned": "Техническая ошибка - попытка возвращена!\n\nПричина: {reason}\n\n/start",
         "not_clicked_returned": "Кнопка не найдена - попытка возвращена!\n\n/start",
-        "link_received": "*Ссылка получена!*\n\nИспользуй сразу - одноразовая!",
+        "link_received": "*Ссылка получена!*\n\n⏱ Действует *10 минут* — используй сразу!\n🔗 Одноразовая ссылка:",
         "failed_returned": "❌ Не удалось получить ссылку — попытка возвращена!",
         "method_camera": "Camera",
         "method_id": "ID",
@@ -373,7 +373,7 @@ TEXTS = {
         "browser_fallback": "API didn't respond, opening browser...\nWait up to 30 sec...",
         "error_returned": "Technical error - attempt returned!\n\nReason: {reason}\n\n/start",
         "not_clicked_returned": "Button not found - attempt returned!\n\n/start",
-        "link_received": "*Link received!*\n\nUse it immediately - one-time only!",
+        "link_received": "*Link received!*\n\n⏱ Valid for *10 minutes* — use it now!\n🔗 One-time link:",
         "failed_returned": "❌ Failed to get link — attempt returned!",
         "method_camera": "Camera",
         "method_id": "ID",
@@ -658,82 +658,58 @@ TWO_FA_JS = """
 """
 
 
-def playwright_get_url_2fa(cookie, method):
+def get_url_via_api_2fa(cookie, method):
     """
-    Playwright метод для аккаунтов с 2FA.
-    Открывает браузер, ждёт прохождения 2FA,
-    затем выполняет JS-скрипт в консоль для получения ссылки.
+    Быстрый API метод для аккаунтов с 2FA.
+    Точно повторяет JS-скрипт из консоли браузера:
+      1й запрос без CSRF → получаем x-csrf-token
+      2й запрос с CSRF → получаем ссылку
+    Занимает ~2-3 секунды, без браузера.
     """
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800},
-                proxy=get_proxy_url(),
-            )
-            ctx.add_cookies([{"name": ".ROBLOSECURITY", "value": cookie, "domain": ".roblox.com", "path": "/"}])
-            page = ctx.new_page()
-            page.add_init_script(INJECT_SCRIPT)
-            page.goto("https://www.roblox.com/my/account#!/info", wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(3000)
+        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+        body_data = {
+            "generateLink": True,
+            "ageEstimation": True,
+            "parentVerification": False,
+        }
 
-            # Проверяем: идёт ли 2FA проверка (security check / verification page)
-            two_fa_indicators = [
-                "verification", "verify", "security check",
-                "проверка", "подтверд", "двухфакторн", "two-step",
-                "2-step", "two step", "authenticator"
-            ]
-            page_content = ""
-            try:
-                page_content = page.content().lower()
-            except Exception:
-                pass
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.proxies.update(get_proxy())
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
 
-            is_2fa = any(kw in page_content for kw in two_fa_indicators)
-            logging.info("2FA check: page has 2FA indicators = %s", is_2fa)
+        # Шаг 1: запрос без CSRF (как send(null) в JS)
+        r1 = s.post(url, json=body_data)
+        csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
+        logging.info("2FA API 1st: status=%d csrf=%s", r1.status_code, csrf)
 
-            if is_2fa:
-                # Выполняем JS-скрипт прямо как в видео (в консоль)
-                logging.info("2FA: executing JS snippet in console")
-                try:
-                    page.evaluate(TWO_FA_JS)
-                except Exception as e:
-                    logging.warning("2FA JS eval error (async, ok to ignore): %s", e)
+        if r1.status_code == 200:
+            link = _extract_api_url(r1)
+            if link:
+                return link
 
-                # Ждём появления результата
-                result_url = None
-                for i in range(15):
-                    page.wait_for_timeout(1000)
-                    try:
-                        # Сначала пробуем __capturedData (из INJECT_SCRIPT)
-                        raw = page.evaluate("() => window.__capturedData")
-                        if raw:
-                            result_url = build_url(raw)
-                            if result_url:
-                                logging.info("2FA: captured via __capturedData after %d sec", i + 1)
-                                break
+        if not csrf:
+            logging.warning("2FA API: no CSRF token received")
+            return None
 
-                        # Затем пробуем __2fa_result (из TWO_FA_JS)
-                        r2 = page.evaluate("() => window.__2fa_result")
-                        if r2 and isinstance(r2, dict) and "raw" not in r2:
-                            result_url = extract_link_from_api(r2)
-                            if result_url:
-                                logging.info("2FA: captured via __2fa_result after %d sec", i + 1)
-                                break
-                    except Exception:
-                        pass
+        # Шаг 2: запрос с CSRF (как send(csrf) в JS)
+        s.headers["x-csrf-token"] = csrf
+        r2 = s.post(url, json=body_data)
+        logging.info("2FA API 2nd: status=%d body=%s", r2.status_code, r2.text[:300])
 
-                browser.close()
-                return result_url
+        if r2.status_code == 200:
+            return _extract_api_url(r2)
 
-            else:
-                # Нет 2FA — стандартный Playwright flow
-                browser.close()
-                return playwright_get_url(cookie, method)
+        return None
 
     except Exception as e:
-        logging.error("Playwright 2FA error: %s", e)
+        logging.error("2FA API error: %s", e)
         return "ERROR: " + str(e)
 
 
@@ -1543,19 +1519,29 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Списываем попытку
     db_upsert_user(user_id, username, attempts_delta=-1)
 
-    await msg.edit_text(
-        t(user_id, "processing", name=user["name"], method=method_name, attempts=db_get_attempts(user_id)),
-        parse_mode="Markdown"
-    )
-
     loop = asyncio.get_event_loop()
     _start_time = _time.time()
     has_2fa = context.user_data.get("has_2fa", False)
 
     if has_2fa:
-        # Для 2FA аккаунтов сразу используем Playwright с JS-скриптом
-        result = await loop.run_in_executor(executor, playwright_get_url_2fa, cookie, method)
-        logging.info("2FA result: %s", result)
+        processing_text = (
+            "Аккаунт: *{name}*\nМетод: *{method}*\nОсталось попыток: *{attempts}*\n\n⚡ 2FA режим — жди 2-5 сек..."
+            if db_get_lang(user_id) == "ru" else
+            "Account: *{name}*\nMethod: *{method}*\nAttempts left: *{attempts}*\n\n⚡ 2FA mode — wait 2-5 sec..."
+        ).format(name=user["name"], method=method_name, attempts=db_get_attempts(user_id))
+    else:
+        processing_text = t(user_id, "processing", name=user["name"], method=method_name, attempts=db_get_attempts(user_id))
+
+    await msg.edit_text(processing_text, parse_mode="Markdown")
+
+    if has_2fa:
+        # Для 2FA — быстрый прямой API запрос (~2-3 сек), без браузера
+        result = await loop.run_in_executor(executor, get_url_via_api_2fa, cookie, method)
+        logging.info("2FA API result: %s", result)
+        # Если API не сработал — пробуем Playwright как fallback
+        if not result or (isinstance(result, str) and result.startswith("ERROR")):
+            await msg.edit_text(t(user_id, "browser_fallback"))
+            result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
     else:
         # Сначала быстрый API метод (~2 сек)
         result = await loop.run_in_executor(executor, get_url_via_api, cookie, method)
