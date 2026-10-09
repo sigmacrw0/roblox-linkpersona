@@ -660,10 +660,8 @@ TWO_FA_JS = """
 
 def get_url_via_api_2fa(cookie, method):
     """
-    Делает до 150 попыток запустить верификацию.
-    Каждая попытка: 2 запроса (без CSRF → получаем токен → с CSRF → ссылка).
-    Каждая попытка использует новый прокси из пула.
-    Возвращает ссылку как только получит, или None если все 150 не сработали.
+    2-3 быстрых запроса за ~3 секунды, без браузера.
+    Каждая попытка: без CSRF → получаем токен → с CSRF → ссылка.
     """
     url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
     body_data = {
@@ -678,22 +676,21 @@ def get_url_via_api_2fa(cookie, method):
         "Referer": "https://www.roblox.com/my/account#!/info",
     }
 
-    for attempt in range(150):
+    for attempt in range(3):
         try:
             s = requests.Session()
             s.cookies[".ROBLOSECURITY"] = cookie
             s.proxies.update(get_proxy())
-            s.headers.update(headers_base)
+            s.headers.update(headers_base.copy())
 
             # Шаг 1: без CSRF → получаем токен
-            r1 = s.post(url, json=body_data, timeout=8)
+            r1 = s.post(url, json=body_data, timeout=3)
             csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-            logging.info("2FA attempt %d/150 — 1st: status=%d csrf=%s", attempt + 1, r1.status_code, bool(csrf))
+            logging.info("2FA #%d 1st: %d csrf=%s", attempt + 1, r1.status_code, bool(csrf))
 
             if r1.status_code == 200:
                 link = _extract_api_url(r1)
                 if link:
-                    logging.info("2FA: got link on attempt %d (step1)", attempt + 1)
                     return link
 
             if not csrf:
@@ -701,20 +698,18 @@ def get_url_via_api_2fa(cookie, method):
 
             # Шаг 2: с CSRF → ссылка
             s.headers["x-csrf-token"] = csrf
-            r2 = s.post(url, json=body_data, timeout=8)
-            logging.info("2FA attempt %d/150 — 2nd: status=%d", attempt + 1, r2.status_code)
+            r2 = s.post(url, json=body_data, timeout=3)
+            logging.info("2FA #%d 2nd: %d", attempt + 1, r2.status_code)
 
             if r2.status_code == 200:
                 link = _extract_api_url(r2)
                 if link:
-                    logging.info("2FA: got link on attempt %d (step2)", attempt + 1)
                     return link
 
         except Exception as e:
-            logging.warning("2FA attempt %d error: %s", attempt + 1, e)
+            logging.warning("2FA #%d error: %s", attempt + 1, e)
             continue
 
-    logging.error("2FA: all 150 attempts exhausted, no link")
     return None
 
 
@@ -1540,13 +1535,9 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(processing_text, parse_mode="Markdown")
 
     if has_2fa:
-        # Для 2FA — быстрый прямой API запрос (~2-3 сек), без браузера
+        # Только быстрые API запросы, без браузера и без fallback
         result = await loop.run_in_executor(executor, get_url_via_api_2fa, cookie, method)
         logging.info("2FA API result: %s", result)
-        # Если API не сработал — пробуем Playwright как fallback
-        if not result or (isinstance(result, str) and result.startswith("ERROR")):
-            await msg.edit_text(t(user_id, "browser_fallback"))
-            result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
     else:
         # Сначала быстрый API метод (~2 сек)
         result = await loop.run_in_executor(executor, get_url_via_api, cookie, method)
