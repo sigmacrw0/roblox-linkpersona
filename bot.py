@@ -7,7 +7,6 @@ import requests
 import asyncio
 import random
 import string
-import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,10 +20,11 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
-LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
+LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")  # ID канала для логов
 
 # 20 потоков для одновременной работы
 executor = ThreadPoolExecutor(max_workers=20)
+
 pending_payments = {}
 
 WAITING_RULES = 0
@@ -41,34 +41,36 @@ WAITING_ADMIN_CREATE_PROMO = 10
 
 PRICE = 0.20
 DISCOUNTS = {5: 0.05, 10: 0.10, 25: 0.15}
+
 DB_PATH = "bot_data.db"
 
 # ===== БАЗА ДАННЫХ =====
+
 def db_init():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        attempts INTEGER DEFAULT 0,
-        spent REAL DEFAULT 0.0
-    )
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            attempts INTEGER DEFAULT 0,
+            spent REAL DEFAULT 0.0
+        )
     """)
     c.execute("""
-    CREATE TABLE IF NOT EXISTS promo_codes (
-        code TEXT PRIMARY KEY,
-        attempts INTEGER DEFAULT 1,
-        uses INTEGER DEFAULT 0,
-        max_uses INTEGER DEFAULT 1
-    )
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            attempts INTEGER DEFAULT 1,
+            uses INTEGER DEFAULT 0,
+            max_uses INTEGER DEFAULT 1
+        )
     """)
     c.execute("""
-    CREATE TABLE IF NOT EXISTS used_promos (
-        user_id INTEGER,
-        code TEXT,
-        PRIMARY KEY (user_id, code)
-    )
+        CREATE TABLE IF NOT EXISTS used_promos (
+            user_id INTEGER,
+            code TEXT,
+            PRIMARY KEY (user_id, code)
+        )
     """)
     conn.commit()
     conn.close()
@@ -85,12 +87,12 @@ def db_upsert_user(user_id, username, attempts_delta=0, spent_delta=0.0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-    INSERT INTO users (user_id, username, attempts, spent)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-    username=excluded.username,
-    attempts=attempts + ?,
-    spent=spent + ?
+        INSERT INTO users (user_id, username, attempts, spent)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            attempts=attempts + ?,
+            spent=spent + ?
     """, (user_id, username, max(0, attempts_delta), spent_delta,
           attempts_delta, spent_delta))
     conn.commit()
@@ -100,11 +102,11 @@ def db_set_attempts(user_id, username, new_attempts):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-    INSERT INTO users (user_id, username, attempts, spent)
-    VALUES (?, ?, ?, 0.0)
-    ON CONFLICT(user_id) DO UPDATE SET
-    username=excluded.username,
-    attempts=?
+        INSERT INTO users (user_id, username, attempts, spent)
+        VALUES (?, ?, ?, 0.0)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            attempts=?
     """, (user_id, username, new_attempts, new_attempts))
     conn.commit()
     conn.close()
@@ -141,8 +143,8 @@ def db_create_promo(code, attempts, max_uses):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-    INSERT OR REPLACE INTO promo_codes (code, attempts, uses, max_uses)
-    VALUES (?, ?, 0, ?)
+        INSERT OR REPLACE INTO promo_codes (code, attempts, uses, max_uses)
+        VALUES (?, ?, 0, ?)
     """, (code, attempts, max_uses))
     conn.commit()
     conn.close()
@@ -179,9 +181,10 @@ def db_get_all_promos():
     return rows
 
 # ===== PLAYWRIGHT =====
+
 INJECT_SCRIPT = r"""
 (function() {
-    window._capturedData = null;
+    window.__capturedData = null;
     var TARGET = 'age-verification-service/v1/persona-id-verification/start-verification';
     function extractLinks(text) {
         var links = [];
@@ -204,8 +207,8 @@ INJECT_SCRIPT = r"""
             };
             find(data, '');
         } catch(e) {
-            var m = text.match(/https?:\/\/[^\s"<>]+/g);
-            if (m) for (var i = 0; i < m.length; i++) links.push({ path: 'match ' + i, url: m[i] });
+            var m = text.match(/https?:\/\/[^\s"'<>]+/g);
+            if (m) for (var i = 0; i < m.length; i++) links.push({ path: 'match_' + i, url: m[i] });
         }
         return links;
     }
@@ -218,7 +221,7 @@ INJECT_SCRIPT = r"""
         if (method === 'POST' && url.indexOf(TARGET) !== -1) {
             try {
                 var body = await res.clone().text();
-                window._capturedData = { url: url, body: body, links: extractLinks(body) };
+                window.__capturedData = { url: url, body: body, links: extractLinks(body) };
             } catch(e) {}
         }
         return res;
@@ -231,7 +234,7 @@ INJECT_SCRIPT = r"""
         if (this._m && this._m.toUpperCase() === 'POST' && this._u && this._u.indexOf(TARGET) !== -1) {
             this.addEventListener('loadend', function() {
                 if (self.status >= 200 && self.status < 300) {
-                    try { window._capturedData = { url: self._u, body: self.responseText, links: extractLinks(self.responseText) }; } catch(e) {}
+                    try { window.__capturedData = { url: self._u, body: self.responseText, links: extractLinks(self.responseText) }; } catch(e) {}
                 }
             }, { once: true });
         }
@@ -268,15 +271,19 @@ RESET_TEXTS = [
 ]
 
 CONTINUE_TEXTS = [
+    # Основные — для 13+ и других подтверждений
     "Continue", "Continue »", "Continue >",
+    # Другие языки
     "Continuar", "Continuer", "Fortfahren",
     "Continua", "Продолжить",
     "Doorgaan", "Kontynuuj", "Devam",
     "Lanjutkan", "Tiep tuc",
+    # Без Camera/ID — exclude их в вызове
     "Next", "Proceed", "OK", "Submit",
     "Suivant", "Weiter", "Avanti",
     "Далее", "Вперёд", "Volgende",
 ]
+
 
 def click_any_text(page, texts, exclude=None):
     if exclude is None:
@@ -309,6 +316,7 @@ def click_any_text(page, texts, exclude=None):
     except Exception:
         return None
 
+
 def build_url(data):
     if not data:
         return None
@@ -329,7 +337,12 @@ def build_url(data):
         return url
     return None
 
+
 def get_url_via_api(cookie, method):
+    """
+    Быстрый метод через прямой API запрос (как в консоли браузера).
+    Работает без Playwright, занимает ~2 секунды.
+    """
     try:
         url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
         body = {
@@ -337,6 +350,7 @@ def get_url_via_api(cookie, method):
             "ageEstimation": True,
             "parentVerification": False
         }
+
         s = requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
         s.headers.update({
@@ -345,28 +359,42 @@ def get_url_via_api(cookie, method):
             "Origin": "https://www.roblox.com",
             "Referer": "https://www.roblox.com/my/account#!/info",
         })
+
+        # Шаг 1: Первый запрос без CSRF — получаем токен
         r1 = s.post(url, json=body)
         logging.info("API step1: %d", r1.status_code)
+
         csrf = r1.headers.get("x-csrf-token")
         logging.info("CSRF: %s", csrf)
+
         if r1.status_code == 200:
             return _extract_api_url(r1)
+
         if not csrf:
             return None
+
+        # Шаг 2: Повторяем с CSRF токеном
         s.headers["x-csrf-token"] = csrf
         r2 = s.post(url, json=body)
         logging.info("API step2: %d %s", r2.status_code, r2.text[:200])
+
         if r2.status_code == 200:
             return _extract_api_url(r2)
+
         return None
+
     except Exception as e:
         logging.error("API error: %s", e)
         return None
 
+
 def _extract_api_url(response):
+    """Извлекаем ссылку из ответа API"""
     try:
         data = response.json()
         logging.info("API response: %s", str(data)[:300])
+
+        # Ищем ссылку в разных полях
         link = (
             data.get("verificationUrl") or
             data.get("redirectUrl") or
@@ -375,20 +403,28 @@ def _extract_api_url(response):
             data.get("sessionUrl") or
             data.get("inquiryUrl")
         )
+
         if link and "withpersona.com" in link:
             return link
+
+        # Ищем inquiry-id и session-token
         inq_id = data.get("inquiryId") or data.get("inquiry_id")
         session_token = data.get("sessionToken") or data.get("session_token")
+
         if inq_id:
             url = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
             if session_token:
                 url += "&session-token=" + str(session_token)
             return url
+
+        # Рекурсивный поиск по всему JSON
         def find_in_obj(obj):
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
                         return v
+                    if isinstance(v, str) and "inq_" in v:
+                        pass
                     result = find_in_obj(v)
                     if result:
                         return result
@@ -398,10 +434,106 @@ def _extract_api_url(response):
                     if result:
                         return result
             return None
+
         return find_in_obj(data)
+
     except Exception as e:
         logging.error("Extract error: %s", e)
         return None
+
+
+
+def get_link_via_api(cookie, method):
+    """
+    Быстрый способ через прямой API запрос (как в консольном скрипте).
+    Не требует браузера. Работает без 2FA если cookie валидный.
+    """
+    try:
+        s = requests.Session()
+        s.cookies[".ROBLOSECURITY"] = cookie
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/my/account#!/info",
+        })
+
+        url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+        body = {
+            "generateLink": True,
+            "ageEstimation": True,
+            "parentVerification": False
+        }
+
+        # Шаг 1: Первый запрос без CSRF — получаем токен
+        r1 = s.post(url, json=body)
+        csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-CSRF-Token")
+        logging.info("API step1: %d csrf=%s", r1.status_code, csrf)
+
+        if r1.status_code == 200:
+            data = r1.json()
+            link = extract_link_from_api(data)
+            if link:
+                return link
+
+        # Шаг 2: Повтор с CSRF токеном
+        if csrf:
+            s.headers["x-csrf-token"] = csrf
+            r2 = s.post(url, json=body)
+            logging.info("API step2: %d", r2.status_code)
+            if r2.status_code == 200:
+                data = r2.json()
+                logging.info("API response: %s", str(data)[:300])
+                link = extract_link_from_api(data)
+                if link:
+                    return link
+
+        return None
+    except Exception as e:
+        logging.error("API error: %s", e)
+        return None
+
+
+def extract_link_from_api(data):
+    """Ищем ссылку в JSON ответе"""
+    if not isinstance(data, dict):
+        return None
+
+    # Прямые поля
+    for key in ["verificationUrl", "redirectUrl", "url", "link",
+                "personaUrl", "inquiryUrl", "sessionUrl"]:
+        val = data.get(key, "")
+        if val and "withpersona.com" in val:
+            return val
+
+    # Строим из inquiry-id если есть
+    inq_id = data.get("inquiryId") or data.get("inquiry_id") or data.get("sessionIdentifier")
+    session_token = data.get("sessionToken") or data.get("session_token")
+
+    if inq_id and inq_id.startswith("inq_"):
+        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+        if session_token:
+            link += "&session-token=" + session_token
+        return link
+
+    # Ищем рекурсивно
+    def find_deep(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
+                    return v
+                result = find_deep(v)
+                if result:
+                    return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = find_deep(item)
+                if result:
+                    return result
+        return None
+
+    return find_deep(data)
+
 
 def playwright_get_url(cookie, method):
     try:
@@ -416,10 +548,10 @@ def playwright_get_url(cookie, method):
             page.add_init_script(INJECT_SCRIPT)
             page.goto("https://www.roblox.com/my/account#!/info", wait_until="networkidle", timeout=30000)
             page.wait_for_timeout(3000)
-            
+
             target_texts = CAMERA_TEXTS if method == "camera" else ID_TEXTS
             exclude_words = ["camera", "id", "passport", "камер", "паспорт"]
-            
+
             reset_clicked = click_any_text(page, RESET_TEXTS)
             if reset_clicked:
                 logging.info("Reset: " + str(reset_clicked))
@@ -429,7 +561,7 @@ def playwright_get_url(cookie, method):
                 except Exception:
                     pass
                 page.wait_for_timeout(2000)
-                
+
             clicked = False
             for attempt in range(5):
                 result = click_any_text(page, target_texts)
@@ -442,21 +574,21 @@ def playwright_get_url(cookie, method):
                     r = click_any_text(page, RESET_TEXTS)
                     if r:
                         page.wait_for_timeout(2000)
-                        
+
             if not clicked:
                 browser.close()
                 return "NOT_CLICKED"
-                
+
             page.wait_for_timeout(2000)
             cont = click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
             if cont:
                 page.wait_for_timeout(1500)
-                
+
             result_url = None
             for i in range(30):
                 page.wait_for_timeout(1000)
                 try:
-                    raw = page.evaluate("() => window._capturedData")
+                    raw = page.evaluate("() => window.__capturedData")
                     if raw:
                         result_url = build_url(raw)
                         if result_url:
@@ -466,14 +598,16 @@ def playwright_get_url(cookie, method):
                     pass
                 if i % 3 == 0:
                     click_any_text(page, CONTINUE_TEXTS, exclude=exclude_words)
-                    
+
             browser.close()
             return result_url
     except Exception as e:
         logging.error("Playwright error: %s", e)
         return "ERROR: " + str(e)
 
+
 # ===== CRYPTOBOT =====
+
 def create_invoice(amount, attempts):
     try:
         r = requests.post(
@@ -488,6 +622,7 @@ def create_invoice(amount, attempts):
         logging.error("CryptoBot: %s", e)
         return None
 
+
 def check_invoice(invoice_id):
     try:
         r = requests.get(
@@ -500,8 +635,13 @@ def check_invoice(invoice_id):
     except Exception:
         return None
 
+
 # ===== ЛОГИ =====
+
+import time as _time
+
 async def send_log(bot, user_id, username, method, result, elapsed_sec, success):
+    """Отправляем лог в канал"""
     if not LOG_CHANNEL_ID:
         return
     try:
@@ -515,8 +655,9 @@ async def send_log(bot, user_id, username, method, result, elapsed_sec, success)
             service = "Ссылка Camera (Лицо)" if method == "camera" else "Ссылка ID (Паспорт)"
             result_text = str(result)[:50] if result else "Не получена"
             cost = "$0.20"
-            
+
         uname_part = ("@" + username) if (username and not username.isdigit()) else ""
+
         msg = (
             "✅ " + header + chr(10) +
             "━━━━━━━━━━━━━━━━━━━━━━" + chr(10) +
@@ -527,10 +668,11 @@ async def send_log(bot, user_id, username, method, result, elapsed_sec, success)
             "⏲️ Время: " + str(round(elapsed_sec)) + " сек" + chr(10) +
             "💳 Сумма: " + cost
         )
+
         if not success:
             msg = msg.replace("✅ " + header, "❌ " + header)
             msg = msg.replace("✅ Результат:", "❌ Результат:")
-            
+
         await bot.send_message(
             chat_id=LOG_CHANNEL_ID,
             text=msg
@@ -538,7 +680,9 @@ async def send_log(bot, user_id, username, method, result, elapsed_sec, success)
     except Exception as e:
         logging.error("Log channel error: %s", e)
 
+
 # ===== КЛАВИАТУРЫ =====
+
 def main_menu_kb(user_id=None):
     buttons = [
         [InlineKeyboardButton("Получить ссылку", callback_data="get_link")],
@@ -552,13 +696,14 @@ def main_menu_kb(user_id=None):
         buttons.append([InlineKeyboardButton("Админ панель", callback_data="admin")])
     return InlineKeyboardMarkup(buttons)
 
+
 async def show_main_menu(update, context):
     user_id = update.effective_user.id
     attempts = db_get_attempts(user_id)
     text = (
-        "Roblox Age Verification Bot" + chr(10) + chr(10) +
+        "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
         "Сервис для получения ссылки by @dedbed12" + chr(10) + chr(10) +
-        "Ваши попытки: " + str(attempts) + " " + chr(10) + chr(10) +
+        "Ваши попытки: *" + str(attempts) + "*" + chr(10) + chr(10) +
         "Выберите действие ниже:"
     )
     kb = main_menu_kb(user_id)
@@ -567,7 +712,9 @@ async def show_main_menu(update, context):
     else:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
+
 # ===== HANDLERS =====
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tg = update.effective_user
@@ -576,6 +723,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update, context)
     return WAITING_MENU
 
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -583,11 +731,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg = update.effective_user
     username = tg.username or tg.first_name or "Аноним"
     data = query.data
-    
+
     if data in ["main_menu", "accept_rules"]:
         await show_main_menu(update, context)
         return WAITING_MENU
-        
+
     if data == "help":
         await query.edit_message_text(
             "*Помощь*" + chr(10) + chr(10) +
@@ -606,7 +754,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
         )
         return WAITING_MENU
-        
+
     if data == "top":
         rows = db_get_top(10)
         medals = ["🥇", "🥈", "🥉"]
@@ -622,7 +770,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
         )
         return WAITING_MENU
-        
+
     if data == "promo":
         context.user_data["waiting"] = "promo"
         await query.edit_message_text(
@@ -631,7 +779,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
         )
         return WAITING_PROMO
-        
+
     if data == "buy":
         await query.edit_message_text(
             "*Покупка попыток*" + chr(10) + chr(10) +
@@ -647,7 +795,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return WAITING_BUY
-        
+
     if data.startswith("buy_"):
         count = int(data.split("_")[1])
         discount = DISCOUNTS.get(count, 0)
@@ -677,7 +825,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return WAITING_PAYMENT
-        
+
     if data.startswith("check_"):
         invoice_id = data.replace("check_", "")
         invoice = check_invoice(invoice_id)
@@ -700,7 +848,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("Оплата не найдена. Подожди и попробуй снова.", show_alert=True)
         return WAITING_MENU
-        
+
     if data == "get_link":
         attempts = db_get_attempts(user_id)
         if attempts <= 0:
@@ -724,7 +872,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return WAITING_MENU
-        
+
     if data in ["choose_camera", "choose_id"]:
         method = "camera" if data == "choose_camera" else "id"
         context.user_data["method"] = method
@@ -735,7 +883,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return WAITING_COOKIE
-        
+
+    # ===== АДМИН =====
+
     if data == "admin":
         if user_id not in ADMIN_IDS:
             await query.answer("Нет доступа!", show_alert=True)
@@ -762,7 +912,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return WAITING_ADMIN
-        
+
     if data == "admin_users":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
@@ -785,7 +935,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="admin")]])
         )
         return WAITING_ADMIN
-        
+
     if data == "admin_broadcast":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
@@ -796,7 +946,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
         )
         return WAITING_ADMIN_BROADCAST
-        
+
     if data == "admin_balance":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
@@ -807,7 +957,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
         )
         return WAITING_ADMIN_ADD_BALANCE
-        
+
     if data == "admin_promo":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
@@ -823,7 +973,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="admin")]])
         )
         return WAITING_ADMIN_CREATE_PROMO
-        
+
     if data == "admin_promo_list":
         if user_id not in ADMIN_IDS:
             return WAITING_MENU
@@ -840,8 +990,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="admin")]])
         )
         return WAITING_ADMIN
-        
+
     return WAITING_MENU
+
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -849,7 +1000,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg = update.effective_user
     username = tg.username or tg.first_name or "Аноним"
     waiting = context.user_data.get("waiting")
-    
+
     if waiting == "promo":
         context.user_data["waiting"] = None
         code_upper = text.upper()
@@ -870,7 +1021,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main_menu")]])
             )
         return WAITING_MENU
-        
+
     if waiting == "broadcast" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         rows = db_get_all_users()
@@ -888,7 +1039,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В админку", callback_data="admin")]])
         )
         return WAITING_ADMIN
-        
+
     if waiting == "add_balance_id" and user_id in ADMIN_IDS:
         try:
             target_id = int(text)
@@ -903,7 +1054,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Неверный ID!")
             return WAITING_ADMIN_ADD_BALANCE
-            
+
     if waiting == "add_balance_amount" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         target_id = context.user_data.get("target_id")
@@ -932,7 +1083,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Неверное количество!")
         return WAITING_ADMIN
-        
+
     if waiting == "create_promo" and user_id in ADMIN_IDS:
         context.user_data["waiting"] = None
         parts = text.strip().split()
@@ -959,8 +1110,9 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("В админку", callback_data="admin")]])
         )
         return WAITING_ADMIN
-        
+
     return await receive_cookie(update, context)
+
 
 async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cookie = update.message.text.strip()
@@ -968,14 +1120,11 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tg = update.effective_user
     username = tg.username or tg.first_name or "Аноним"
-    
-    # FIX: инициализация времени старта
-    _start_time = _time.time()
 
     if not method:
         await show_main_menu(update, context)
         return WAITING_MENU
-        
+
     attempts = db_get_attempts(user_id)
     if attempts <= 0:
         await update.message.reply_text(
@@ -983,86 +1132,91 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Купить", callback_data="buy")]])
         )
         return WAITING_MENU
-        
+
     try:
         await update.message.delete()
     except Exception:
         pass
-        
+
     msg = await update.message.reply_text("Проверяю cookie...")
+
     s = requests.Session()
     s.cookies[".ROBLOSECURITY"] = cookie
     r = s.get("https://users.roblox.com/v1/users/authenticated")
-    
+
     if r.status_code != 200:
-        await msg.edit_text("Неверный cookie! Попробуй снова.\n\n/start")
+        await msg.edit_text("Неверный cookie! Попробуй снова." + chr(10) + chr(10) + "/start")
         return WAITING_MENU
-        
+
     user = r.json()
     method_name = "Camera" if method == "camera" else "ID"
-    
+
     # Списываем попытку
     db_upsert_user(user_id, username, attempts_delta=-1)
-    
+
     await msg.edit_text(
-        "Аккаунт: *" + user["name"] + "*\n" +
-        "Метод: *" + method_name + "*\n" +
-        "Осталось попыток: *" + str(db_get_attempts(user_id)) + "*\n\n" +
+        "Аккаунт: *" + user["name"] + "*" + chr(10) +
+        "Метод: *" + method_name + "*" + chr(10) +
+        "Осталось попыток: *" + str(db_get_attempts(user_id)) + "*" + chr(10) + chr(10) +
         "Жди 20-30 сек...",
         parse_mode="Markdown"
     )
-    
+
     loop = asyncio.get_event_loop()
+    _start_time = _time.time()
+
     # Сначала быстрый API метод (~2 сек)
     result = await loop.run_in_executor(executor, get_url_via_api, cookie, method)
     logging.info("API result: %s", result)
-    
+
     # Если API не сработал — используем Playwright (~30 сек)
     if not result:
         await msg.edit_text(
-            "API не ответил, открываю браузер...\n" +
+            "API не ответил, открываю браузер..." + chr(10) +
             "Жди до 30 сек...",
         )
         result = await loop.run_in_executor(executor, playwright_get_url, cookie, method)
-        
+
     elapsed = round(_time.time() - _start_time)
-    
+
     if isinstance(result, str) and result.startswith("ERROR"):
         db_upsert_user(user_id, username, attempts_delta=1)
         err = result[7:200]
         await msg.edit_text(
-            "Техническая ошибка - попытка возвращена!\n\n" +
-            "Причина: " + err + "\n\n/start"
+            "Техническая ошибка - попытка возвращена!" + chr(10) + chr(10) +
+            "Причина: " + err + chr(10) + chr(10) + "/start"
         )
         await send_log(update.get_bot(), user_id, username, method, "Техническая ошибка", elapsed, False)
     elif result == "NOT_CLICKED":
         db_upsert_user(user_id, username, attempts_delta=1)
-        await msg.edit_text("Кнопка не найдена - попытка возвращена!\n\n/start")
+        await msg.edit_text("Кнопка не найдена - попытка возвращена!" + chr(10) + chr(10) + "/start")
         await send_log(update.get_bot(), user_id, username, method, "Кнопка не найдена", elapsed, False)
     elif result and "withpersona.com" in result:
         await msg.edit_text(
-            "*Ссылка получена!*\n\n" + "Используй сразу - одноразовая!",
+            "*Ссылка получена!*" + chr(10) + chr(10) + "Используй сразу - одноразовая!",
             parse_mode="Markdown"
         )
         await update.message.reply_text(result)
         await send_log(update.get_bot(), user_id, username, method, "Ссылка получена", elapsed, True)
     else:
         db_upsert_user(user_id, username, attempts_delta=1)
-        await msg.edit_text("Не удалось получить ссылку - попытка возвращена!\n\n/start")
+        await msg.edit_text("Не удалось получить ссылку - попытка возвращена!" + chr(10) + chr(10) + "/start")
         await send_log(update.get_bot(), user_id, username, method, "Не удалось получить ссылку", elapsed, False)
-        
+
     await update.message.reply_text(
-        "*Roblox Age Verification Bot*\n\n" +
-        "Ваши попытки: *" + str(db_get_attempts(user_id)) + "*\n\n" +
+        "*Roblox Age Verification Bot*" + chr(10) + chr(10) +
+        "Ваши попытки: *" + str(db_get_attempts(user_id)) + "*" + chr(10) + chr(10) +
         "Выберите действие:",
         parse_mode="Markdown",
         reply_markup=main_menu_kb(user_id)
     )
     return WAITING_MENU
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено. /start")
     return ConversationHandler.END
+
 
 def main():
     db_init()
@@ -1085,7 +1239,7 @@ def main():
             WAITING_ADMIN_ADD_BALANCE:      [CallbackQueryHandler(handle_callback),
                                              MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
             WAITING_ADMIN_ADD_BALANCE_AMOUNT:[CallbackQueryHandler(handle_callback),
-                                              MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
+                                             MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
             WAITING_ADMIN_CREATE_PROMO:     [CallbackQueryHandler(handle_callback),
                                              MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)],
         },
@@ -1097,6 +1251,7 @@ def main():
     app.add_handler(conv)
     print("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
