@@ -17,6 +17,46 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 
+# ===== ПРОКСИ =====
+# Формат: host:port:user:pass
+_PROXY_LIST = [
+    "dc.decodo.com:10001:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10002:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10003:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10004:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10005:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10006:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10007:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10008:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10009:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+    "dc.decodo.com:10010:sp13uinlcj:3lS0aw8eHMcJr~tm4v",
+]
+_proxy_index = 0
+_proxy_lock = __import__("threading").Lock()
+
+def get_proxy():
+    """Возвращает следующий прокси по кругу (round-robin)."""
+    global _proxy_index
+    with _proxy_lock:
+        entry = _PROXY_LIST[_proxy_index % len(_PROXY_LIST)]
+        _proxy_index += 1
+    host, port, user, passwd = entry.split(":")
+    proxy_url = f"http://{user}:{passwd}@{host}:{port}"
+    return {"http": proxy_url, "https": proxy_url}
+
+def get_proxy_url():
+    """Возвращает строку прокси для Playwright."""
+    global _proxy_index
+    with _proxy_lock:
+        entry = _PROXY_LIST[_proxy_index % len(_PROXY_LIST)]
+        _proxy_index += 1
+    host, port, user, passwd = entry.split(":")
+    return {
+        "server": f"http://{host}:{port}",
+        "username": user,
+        "password": passwd,
+    }
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
@@ -546,6 +586,7 @@ def get_url_via_api(cookie, method):
 
         s = requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
+        s.proxies.update(get_proxy())
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             "Content-Type": "application/json;charset=utf-8",
@@ -628,7 +669,8 @@ def playwright_get_url_2fa(cookie, method):
             browser = p.chromium.launch(headless=True)
             ctx = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
+                viewport={"width": 1280, "height": 800},
+                proxy=get_proxy_url(),
             )
             ctx.add_cookies([{"name": ".ROBLOSECURITY", "value": cookie, "domain": ".roblox.com", "path": "/"}])
             page = ctx.new_page()
@@ -758,6 +800,7 @@ def get_link_via_api(cookie, method):
     try:
         s = requests.Session()
         s.cookies[".ROBLOSECURITY"] = cookie
+        s.proxies.update(get_proxy())
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Content-Type": "application/json;charset=utf-8",
@@ -848,7 +891,8 @@ def playwright_get_url(cookie, method):
             browser = p.chromium.launch(headless=True)
             ctx = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
+                viewport={"width": 1280, "height": 800},
+                proxy=get_proxy_url(),
             )
             ctx.add_cookies([{"name": ".ROBLOSECURITY", "value": cookie, "domain": ".roblox.com", "path": "/"}])
             page = ctx.new_page()
@@ -1486,6 +1530,7 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     s = requests.Session()
     s.cookies[".ROBLOSECURITY"] = cookie
+    s.proxies.update(get_proxy())
     r = s.get("https://users.roblox.com/v1/users/authenticated")
 
     if r.status_code != 200:
