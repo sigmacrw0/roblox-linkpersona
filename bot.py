@@ -659,65 +659,51 @@ TWO_FA_JS = """
 
 
 def _2fa_worker(cookie, stop_event, result_box, worker_id):
-    """
-    Один воркер — крутится в цикле до 2 минут или пока stop_event не установлен.
-    Каждую итерацию: получает CSRF → шлёт запрос с CSRF → проверяет ссылку.
-    """
     import time as _t
     url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
     body_data = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-    headers_base = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json;charset=utf-8",
-        "Origin": "https://www.roblox.com",
-        "Referer": "https://www.roblox.com/my/account#!/info",
-    }
-    deadline = _t.time() + 120  # 2 минуты
+    deadline = _t.time() + 120
 
-    req_count = 0
     while not stop_event.is_set() and _t.time() < deadline:
         try:
-            s = requests.Session()
-            s.cookies[".ROBLOSECURITY"] = cookie
-            s.proxies.update(get_proxy())
-            s.headers.update(headers_base.copy())
+            proxy = get_proxy()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json;charset=utf-8",
+                "Origin": "https://www.roblox.com",
+                "Referer": "https://www.roblox.com/my/account#!/info",
+            }
+            cookies = {".ROBLOSECURITY": cookie}
 
-            # Запрос 1: получаем CSRF
-            r1 = s.post(url, json=body_data, timeout=8)
-            req_count += 1
+            # Запрос 1: без CSRF
+            r1 = requests.post(url, json=body_data, headers=headers, cookies=cookies, proxies=proxy, timeout=5)
             csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
+            logging.info("w#%d r1=%d csrf=%s body=%s", worker_id, r1.status_code, bool(csrf), r1.text[:200])
 
             if r1.status_code == 200:
                 link = _extract_api_url(r1)
                 if link and not stop_event.is_set():
                     stop_event.set()
                     result_box.append(link)
-                    logging.info("2FA worker#%d got link on req#%d (step1)", worker_id, req_count)
                     return
 
-            if stop_event.is_set():
-                return
-
-            if not csrf:
+            if stop_event.is_set() or not csrf:
                 continue
 
-            # Запрос 2: с CSRF → ссылка
-            s.headers["x-csrf-token"] = csrf
-            r2 = s.post(url, json=body_data, timeout=8)
-            req_count += 1
+            # Запрос 2: с CSRF
+            headers["x-csrf-token"] = csrf
+            r2 = requests.post(url, json=body_data, headers=headers, cookies=cookies, proxies=proxy, timeout=5)
+            logging.info("w#%d r2=%d body=%s", worker_id, r2.status_code, r2.text[:200])
 
             if r2.status_code == 200:
                 link = _extract_api_url(r2)
                 if link and not stop_event.is_set():
                     stop_event.set()
                     result_box.append(link)
-                    logging.info("2FA worker#%d got link on req#%d (step2)", worker_id, req_count)
                     return
 
         except Exception as e:
-            logging.warning("2FA worker#%d error: %s", worker_id, e)
-
-    logging.info("2FA worker#%d done, total reqs: %d", worker_id, req_count)
+            logging.warning("w#%d err: %s", worker_id, e)
 
 
 def get_url_via_api_2fa(cookie, method):
@@ -750,56 +736,52 @@ def get_url_via_api_2fa(cookie, method):
 
 
 def _extract_api_url(response):
-    """Извлекаем ссылку из ответа API"""
+    """Извлекаем ссылку из ответа API — ищем любой https URL в JSON"""
     try:
+        raw = response.text
+        logging.info("FULL API response [%d]: %s", response.status_code, raw[:500])
+
         data = response.json()
-        logging.info("API response: %s", str(data)[:300])
 
-        # Ищем ссылку в разных полях
-        link = (
-            data.get("verificationUrl") or
-            data.get("redirectUrl") or
-            data.get("url") or
-            data.get("personaUrl") or
-            data.get("sessionUrl") or
-            data.get("inquiryUrl")
-        )
-
-        if link and "withpersona.com" in link:
-            return link
-
-        # Ищем inquiry-id и session-token
-        inq_id = data.get("inquiryId") or data.get("inquiry_id")
-        session_token = data.get("sessionToken") or data.get("session_token")
-
-        if inq_id:
-            url = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
-            if session_token:
-                url += "&session-token=" + str(session_token)
-            return url
-
-        # Рекурсивный поиск по всему JSON
         def find_in_obj(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
-                        return v
-                    if isinstance(v, str) and "inq_" in v:
-                        pass
-                    result = find_in_obj(v)
-                    if result:
-                        return result
+            if isinstance(obj, str):
+                if "withpersona.com" in obj or "persona.com" in obj:
+                    return obj
+                if obj.startswith("https://") and ("verify" in obj or "inquiry" in obj or "inq_" in obj):
+                    return obj
+            elif isinstance(obj, dict):
+                # Приоритетные поля
+                for key in ("verificationUrl", "redirectUrl", "url", "personaUrl",
+                            "sessionUrl", "inquiryUrl", "link", "verifyUrl"):
+                    val = obj.get(key)
+                    if val and isinstance(val, str) and val.startswith("http"):
+                        logging.info("Found link in key '%s': %s", key, val)
+                        return val
+                # Рекурсивно по всем полям
+                for v in obj.values():
+                    r = find_in_obj(v)
+                    if r:
+                        return r
+                # Собираем inquiry-id + session-token
+                inq_id = obj.get("inquiryId") or obj.get("inquiry_id") or obj.get("inqId")
+                if inq_id:
+                    token = obj.get("sessionToken") or obj.get("session_token") or obj.get("token") or ""
+                    link = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
+                    if token:
+                        link += "&session-token=" + str(token)
+                    logging.info("Built link from inquiryId: %s", link)
+                    return link
             elif isinstance(obj, list):
                 for item in obj:
-                    result = find_in_obj(item)
-                    if result:
-                        return result
+                    r = find_in_obj(item)
+                    if r:
+                        return r
             return None
 
         return find_in_obj(data)
 
     except Exception as e:
-        logging.error("Extract error: %s", e)
+        logging.error("Extract error: %s | raw: %s", e, response.text[:300])
         return None
 
 
