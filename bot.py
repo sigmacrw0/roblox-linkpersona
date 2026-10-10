@@ -818,18 +818,23 @@ async (arkoseToken, csrf) => {
                       wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
 
-            for attempt in range(60):
+            import time as _t
+            deadline = _t.time() + 600  # 10 минут
+            attempt = 0
+
+            while _t.time() < deadline:
                 if page.is_closed():
                     break
+                attempt += 1
                 try:
                     result = page.evaluate(JS_FETCH)
-                    status       = result.get("status")
-                    body         = result.get("body", "")
-                    csrf         = result.get("csrf")
-                    challenge_id = result.get("challengeId")
-                    challenge_type = result.get("challengeType", "")
+                    status         = result.get("status")
+                    body           = result.get("body", "")
+                    csrf           = result.get("csrf")
+                    challenge_id   = result.get("challengeId")
+                    challenge_type = result.get("challengeType") or ""
                     logging.info("2FA attempt#%d status=%d challenge=%s body=%s",
-                                 attempt + 1, status, challenge_type, body[:200])
+                                 attempt, status, challenge_type, body[:200])
 
                     # Успех
                     if status == 200:
@@ -839,23 +844,28 @@ async (arkoseToken, csrf) => {
                             data = {}
                         link = extract_link_from_api(data)
                         if link:
-                            logging.info("2FA: got link on attempt#%d", attempt + 1)
+                            logging.info("2FA: got link on attempt#%d", attempt)
                             browser.close()
                             return link
 
-                    # Challenge (403 с arkose) — решаем через cap.guru
-                    if status == 403 and CAP_GURU_KEY and ("arkose" in challenge_type.lower() or challenge_id):
-                        logging.info("2FA: challenge detected, solving via cap.guru...")
+                    # twostepverification — ждём пока пользователь подтвердит email/app
+                    if status == 403 and "twostepverification" in challenge_type.lower():
+                        logging.info("2FA: twostepverification detected, waiting for user to confirm...")
+                        page.wait_for_timeout(4000)
+                        continue
+
+                    # Arkose FunCaptcha — решаем через cap.guru
+                    if status == 403 and CAP_GURU_KEY and challenge_type and "arkose" in challenge_type.lower():
+                        logging.info("2FA: arkose challenge, solving via cap.guru...")
                         arkose_token = capguru_solve_funcaptcha(
-                            public_key="476068BF-9607-4799-B53D-966BE98E2B81",  # Roblox Arkose public key
+                            public_key="476068BF-9607-4799-B53D-966BE98E2B81",
                             page_url="https://www.roblox.com",
                             proxy=get_proxy(),
                         )
                         if arkose_token and csrf:
-                            logging.info("2FA: got arkose token, sending with it...")
                             r2 = page.evaluate(JS_WITH_ARKOSE, arkose_token, csrf)
-                            s2   = r2.get("status")
-                            b2   = r2.get("body", "")
+                            s2 = r2.get("status")
+                            b2 = r2.get("body", "")
                             logging.info("2FA arkose result: status=%d body=%s", s2, b2[:200])
                             if s2 == 200:
                                 try:
@@ -864,17 +874,20 @@ async (arkoseToken, csrf) => {
                                     data = {}
                                 link = extract_link_from_api(data)
                                 if link:
-                                    logging.info("2FA: got link via cap.guru on attempt#%d", attempt + 1)
+                                    logging.info("2FA: got link via cap.guru on attempt#%d", attempt)
                                     browser.close()
                                     return link
+                        page.wait_for_timeout(1000)
+                        continue
 
+                    # 429 — притормозить
                     if status == 429:
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(4000)
                     else:
                         page.wait_for_timeout(800)
 
                 except Exception as e:
-                    logging.warning("2FA attempt#%d err: %s", attempt + 1, e)
+                    logging.warning("2FA attempt#%d err: %s", attempt, e)
                     page.wait_for_timeout(1000)
 
             browser.close()
@@ -1693,9 +1706,9 @@ async def receive_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if has_2fa:
         processing_text = (
-            "Аккаунт: *{name}*\nМетод: *{method}*\nОсталось попыток: *{attempts}*\n\n⚡ 2FA режим — жди 2-5 сек..."
+            "Аккаунт: *{name}*\nМетод: *{method}*\nОсталось попыток: *{attempts}*\n\n⚡ 2FA режим - Пытаюсь получить ссылку"
             if db_get_lang(user_id) == "ru" else
-            "Account: *{name}*\nMethod: *{method}*\nAttempts left: *{attempts}*\n\n⚡ 2FA mode — wait 2-5 sec..."
+            "Account: *{name}*\nMethod: *{method}*\nAttempts left: *{attempts}*\n\n⚡ 2FA mode - Trying to get link"
         ).format(name=user["name"], method=method_name, attempts=db_get_attempts(user_id))
     else:
         processing_text = t(user_id, "processing", name=user["name"], method=method_name, attempts=db_get_attempts(user_id))
