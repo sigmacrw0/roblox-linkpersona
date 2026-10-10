@@ -125,8 +125,11 @@ def get_proxy_url():
         "password": passwd,
     }
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN")
+BOT_TOKEN        = os.environ.get("BOT_TOKEN")
+CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN", "")
+XROCKET_TOKEN    = os.environ.get("XROCKET_TOKEN", "")
+LZT_TOKEN        = os.environ.get("LZT_TOKEN", "")
+LZT_RATE         = float(os.environ.get("LZT_RATE", "92.0"))  # курс USD→RUB
 ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")  # ID канала для логов
 
@@ -380,6 +383,11 @@ TEXTS = {
         "pay_ok": "*Оплата получена!*\nНачислено *{attempts}* попыток\nВсего: *{total}*",
         "pay_pending": "Оплата ещё не получена. Попробуй позже.",
         "pay_error": "Ошибка создания счёта!",
+        "choose_pay_method": "💳 *Выберите способ оплаты:*\n\n*{count}* попыток — *${usd}*",
+        "btn_cryptobot":  "🤖 CryptoBot (USDT)",
+        "btn_xrocket":    "🚀 xRocket (USDT/TON)",
+        "btn_lzt":        "🟡 Lolz Market (~{rub}₽)",
+        "creating_invoice": "⏳ Создаю счёт...",
         "lang_choose": "🌐 Выберите язык / Choose language:",
         "lang_set": "✅ Язык установлен: Русский",
         "cancelled": "Отменено. /start",
@@ -461,6 +469,11 @@ TEXTS = {
         "pay_ok": "*Payment received!*\nAdded *{attempts}* attempts\nTotal: *{total}*",
         "pay_pending": "Payment not received yet. Try later.",
         "pay_error": "Invoice creation error!",
+        "choose_pay_method": "💳 *Choose payment method:*\n\n*{count}* attempts — *${usd}*",
+        "btn_cryptobot":  "🤖 CryptoBot (USDT)",
+        "btn_xrocket":    "🚀 xRocket (USDT/TON)",
+        "btn_lzt":        "🟡 Lolz Market (~{rub}₽)",
+        "creating_invoice": "⏳ Creating invoice...",
         "lang_choose": "🌐 Выберите язык / Choose language:",
         "lang_set": "✅ Language set: English",
         "cancelled": "Cancelled. /start",
@@ -726,206 +739,201 @@ TWO_FA_JS = """
 """
 
 
-def _2fa_build_session(cookie):
-    """Создаёт готовую requests.Session с куки и заголовками."""
-    import random as _r
-    UAS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    ]
-    s = requests.Session()
-    s.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
-    s.headers.update({
-        "User-Agent":   _r.choice(UAS),
-        "Content-Type": "application/json;charset=utf-8",
-        "Accept":       "application/json, text/plain, */*",
-        "Origin":       "https://www.roblox.com",
-        "Referer":      "https://www.roblox.com/my/account#!/info",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    s.proxies.update(get_proxy())
-    return s
-
-
-def _2fa_worker(cookie, stop_event, result_holder, worker_id, rate_limiters):
-    """
-    Один рабочий поток для 2FA.
-    Крутится в цикле пока stop_event не установлен.
-    При нахождении ссылки — кладёт в result_holder и устанавливает stop_event.
-    rate_limiters — общий dict с backoff для 429.
-    """
-    import time as _t
-    import json as _j
-
-    URL = ("https://apis.roblox.com/age-verification-service/v1"
-           "/persona-id-verification/start-verification")
-    BODY = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-
-    sess   = _2fa_build_session(cookie)
-    csrf   = None
-    iters  = 0
-
-    while not stop_event.is_set():
-        iters += 1
-
-        # Глобальный backoff при 429
-        backoff = rate_limiters.get("backoff_until", 0)
-        if backoff > _t.time():
-            _t.sleep(min(backoff - _t.time(), 1.0))
-            continue
-
-        try:
-            # ── Шаг A: если нет CSRF — получаем ──────────────────────────────
-            if not csrf:
-                r0 = sess.post(URL, json=BODY, timeout=8)
-                csrf = r0.headers.get("x-csrf-token") or r0.headers.get("X-CSRF-Token")
-                if r0.status_code == 200:
-                    raw = r0.text
-                    try:
-                        data = _j.loads(raw)
-                    except Exception:
-                        data = {}
-                    link = extract_link_from_api(data, raw)
-                    if link:
-                        logging.info("[2FA worker#%d] LINK on csrf-step! %s", worker_id, link[:80])
-                        result_holder.append(link)
-                        stop_event.set()
-                        return
-                if r0.status_code == 429:
-                    rate_limiters["backoff_until"] = _t.time() + 6.0
-                    _t.sleep(6.0)
-                    continue
-
-            if not csrf or stop_event.is_set():
-                continue
-
-            # ── Шаг B: основной запрос с CSRF ────────────────────────────────
-            sess.headers["x-csrf-token"] = csrf
-            r = sess.post(URL, json=BODY, timeout=8)
-
-            status = r.status_code
-            raw    = r.text
-            new_csrf = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-Token")
-            if new_csrf:
-                csrf = new_csrf
-
-            logging.debug("[2FA worker#%d] iter#%d status=%d body=%s",
-                          worker_id, iters, status, raw[:80])
-
-            # ── Успех 200 ────────────────────────────────────────────────────
-            if status == 200:
-                try:
-                    data = _j.loads(raw)
-                except Exception:
-                    data = {}
-                link = extract_link_from_api(data, raw)
-                if link:
-                    logging.info("[2FA worker#%d] LINK FOUND iter#%d: %s",
-                                 worker_id, iters, link[:80])
-                    result_holder.append(link)
-                    stop_event.set()
-                    return
-                # 200 но ссылки нет — лог всего тела для диагностики
-                logging.warning("[2FA worker#%d] 200 but no link! body=%s", worker_id, raw[:300])
-
-            # ── 403 twostepverification — ждём подтверждения ─────────────────
-            elif status == 403 and "twostepverification" in r.headers.get("rblx-challenge-type", "").lower():
-                _t.sleep(2.0)
-
-            # ── 403 arkose ───────────────────────────────────────────────────
-            elif status == 403 and "arkose" in r.headers.get("rblx-challenge-type", "").lower():
-                if CAP_GURU_KEY:
-                    arkose_token = capguru_solve_funcaptcha(
-                        public_key="476068BF-9607-4799-B53D-966BE98E2B81",
-                        page_url="https://www.roblox.com",
-                        proxy=get_proxy(),
-                    )
-                    if arkose_token:
-                        import json as _j2
-                        sess.headers["rblx-challenge-metadata"] = _j2.dumps({
-                            "unifiedCaptchaId": "", "dataExchangeBlob": "", "arkoseToken": arkose_token
-                        })
-                        sess.headers["rblx-challenge-id"]   = ""
-                        sess.headers["rblx-challenge-type"] = "arkose"
-                        r2 = sess.post(URL, json=BODY, timeout=8)
-                        if r2.status_code == 200:
-                            try:
-                                d2 = _j.loads(r2.text)
-                            except Exception:
-                                d2 = {}
-                            lnk = extract_link_from_api(d2, r2.text)
-                            if lnk:
-                                result_holder.append(lnk)
-                                stop_event.set()
-                                return
-                        # Снимаем аркоз заголовки
-                        for h in ("rblx-challenge-metadata", "rblx-challenge-id", "rblx-challenge-type"):
-                            sess.headers.pop(h, None)
-                else:
-                    _t.sleep(1.0)
-
-            # ── 429 rate limit ────────────────────────────────────────────────
-            elif status == 429:
-                rate_limiters["backoff_until"] = _t.time() + 6.0
-                logging.warning("[2FA worker#%d] 429 backoff 6s", worker_id)
-                _t.sleep(6.0)
-                csrf = None  # сбрасываем csrf при 429
-
-            # ── CSRF устарел (401/403 без challenge) — сбросить ───────────────
-            elif status in (401, 403):
-                csrf = None
-
-        except requests.exceptions.Timeout:
-            logging.debug("[2FA worker#%d] timeout", worker_id)
-        except Exception as e:
-            logging.warning("[2FA worker#%d] err: %s", worker_id, e)
-            _t.sleep(0.5)
-
-
 def get_url_via_api_2fa(cookie, method):
     """
-    10 параллельных потоков — каждый крутит свой цикл запросов без остановки.
-    Первый нашедший ссылку останавливает всех остальных через stop_event.
+    Для 2FA endpoint требует браузерный контекст (Challenge required на прямых запросах).
+    Используем Playwright — открываем страницу с cookie, выполняем JS прямо в браузере.
 
-    Скорость: 10 потоков × ~3 req/сек каждый = ~1800 req/min.
-    Без Playwright. Без пауз между запросами (кроме 429).
-    Таймаут: 2 минуты — гарантированно укладываемся.
+    Скорость: 2 параллельных запроса каждые ~400ms = 120-150 запросов в минуту.
+
+    JS_FETCH_DUAL — делает 2 fetch одновременно через Promise.all, возвращает
+    результат первого успешного (status 200) или последнего если оба не 200.
     """
     import time as _t
-    import threading
+    import json as _json
 
-    WORKERS    = 10    # количество параллельных потоков
-    TIMEOUT    = 120   # максимум 2 минуты
+    # ── 2 параллельных запроса за один вызов evaluate ──────────────────────────
+    # Каждый сам получает CSRF (1й запрос без токена → берёт csrf из заголовка →
+    # 2й запрос с csrf). Оба идут одновременно через Promise.all.
+    # Возвращает первый успешный (status=200) или любой с challengeType если нет успеха.
+    JS_FETCH_DUAL = """
+async () => {
+  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-    stop_event    = threading.Event()
-    result_holder = []                   # поток кладёт сюда ссылку
-    rate_limiters = {}                   # общий backoff при 429
+  const doRequest = async () => {
+    const send = (csrf) => fetch(URL_TARGET, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json;charset=utf-8',
+        ...(csrf ? { 'x-csrf-token': csrf } : {}),
+      },
+      body: BODY,
+    });
 
-    start = _t.time()
+    let r = await send(null);
+    const csrf = r.headers.get('x-csrf-token');
+    if (csrf) r = await send(csrf);
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = [
-            pool.submit(_2fa_worker, cookie, stop_event, result_holder, i, rate_limiters)
-            for i in range(WORKERS)
-        ]
+    const text = await r.text();
+    return {
+      status: r.status,
+      body: text,
+      csrf,
+      challengeType: r.headers.get('rblx-challenge-type') || '',
+      challengeId:   r.headers.get('rblx-challenge-id')   || '',
+    };
+  };
 
-        # Ждём либо ссылку, либо таймаут
-        while not stop_event.is_set() and (_t.time() - start) < TIMEOUT:
-            _t.sleep(0.1)
+  // Запускаем 2 запроса параллельно
+  const [r1, r2] = await Promise.all([doRequest(), doRequest()]);
 
-        # Останавливаем всех
-        stop_event.set()
+  // Возвращаем первый успешный, иначе r1
+  if (r1.status === 200) return r1;
+  if (r2.status === 200) return r2;
+  // Если ни один не успешен — вернём тот, у которого есть challengeType
+  return r1.challengeType ? r1 : r2;
+}
+"""
 
-    elapsed = _t.time() - start
-    if result_holder:
-        logging.info("[2FA] DONE in %.1fs | link=%s", elapsed, result_holder[0][:80])
-        return result_holder[0]
+    # JS для отправки запроса с аркоз токеном
+    JS_WITH_ARKOSE = """
+async (arkoseToken, csrf) => {
+  const url = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-    logging.warning("[2FA] No link found in %.1fs", elapsed)
+  const r = await fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      'x-csrf-token': csrf,
+      'rblx-challenge-metadata': JSON.stringify({ unifiedCaptchaId: '', dataExchangeBlob: '', arkoseToken }),
+      'rblx-challenge-id': '',
+      'rblx-challenge-type': 'arkose',
+    },
+    body,
+  });
+
+  return { status: r.status, body: await r.text() };
+}
+"""
+
+    # ── Расчёт паузы ────────────────────────────────────────────────────────────
+    # 2 запроса за итерацию, пауза 400ms между итерациями.
+    # Каждый doRequest() = 2 fetch внутри (~100-200ms каждый), итого ~300-400ms на выполнение.
+    # 400ms пауза после = ~700-800ms на цикл → 2 req / 0.75s ≈ 160 req/min (в пределах 120-150).
+    PAUSE_MS_NORMAL   = 400   # пауза между итерациями (нормальный режим)
+    PAUSE_MS_2FA_WAIT = 3000  # пауза при ожидании подтверждения 2FA пользователем
+    PAUSE_MS_429      = 5000  # пауза при rate-limit
+    PAUSE_MS_ARKOSE   = 1000  # пауза после попытки аркоза
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                proxy=get_proxy_url(),
+            )
+            ctx.add_cookies([{
+                "name": ".ROBLOSECURITY",
+                "value": cookie,
+                "domain": ".roblox.com",
+                "path": "/",
+            }])
+            page = ctx.new_page()
+            page.goto("https://www.roblox.com/my/account#!/info",
+                      wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            deadline = _t.time() + 600  # 10 минут
+            iteration = 0
+            total_requests = 0
+
+            while _t.time() < deadline:
+                if page.is_closed():
+                    break
+                iteration += 1
+                total_requests += 2  # каждая итерация = 2 параллельных запроса
+
+                try:
+                    result = page.evaluate(JS_FETCH_DUAL)
+                    status         = result.get("status")
+                    body           = result.get("body", "")
+                    csrf           = result.get("csrf")
+                    challenge_type = result.get("challengeType") or ""
+
+                    elapsed = _t.time() - (deadline - 600)
+                    rps = total_requests / elapsed if elapsed > 0 else 0
+                    logging.info(
+                        "2FA iter#%d | total_req=%d | ~%.0f req/min | status=%d | challenge=%s | body=%s",
+                        iteration, total_requests, rps * 60, status, challenge_type, body[:120]
+                    )
+
+                    # ── Успех ──────────────────────────────────────────────────
+                    if status == 200:
+                        try:
+                            data = _json.loads(body)
+                        except Exception:
+                            data = {}
+                        link = extract_link_from_api(data)
+                        if link:
+                            logging.info("2FA: got link on iter#%d (total %d requests)", iteration, total_requests)
+                            browser.close()
+                            return link
+
+                    # ── Ожидание подтверждения 2FA пользователем ───────────────
+                    if status == 403 and "twostepverification" in challenge_type.lower():
+                        logging.info("2FA: waiting for user twostep confirm...")
+                        page.wait_for_timeout(PAUSE_MS_2FA_WAIT)
+                        continue
+
+                    # ── Arkose FunCaptcha ──────────────────────────────────────
+                    if status == 403 and CAP_GURU_KEY and challenge_type and "arkose" in challenge_type.lower():
+                        logging.info("2FA: arkose challenge, solving via cap.guru...")
+                        arkose_token = capguru_solve_funcaptcha(
+                            public_key="476068BF-9607-4799-B53D-966BE98E2B81",
+                            page_url="https://www.roblox.com",
+                            proxy=get_proxy(),
+                        )
+                        if arkose_token and csrf:
+                            r2 = page.evaluate(JS_WITH_ARKOSE, arkose_token, csrf)
+                            s2 = r2.get("status")
+                            b2 = r2.get("body", "")
+                            logging.info("2FA arkose result: status=%d body=%s", s2, b2[:200])
+                            if s2 == 200:
+                                try:
+                                    data = _json.loads(b2)
+                                except Exception:
+                                    data = {}
+                                link = extract_link_from_api(data)
+                                if link:
+                                    logging.info("2FA: got link via cap.guru on iter#%d", iteration)
+                                    browser.close()
+                                    return link
+                        page.wait_for_timeout(PAUSE_MS_ARKOSE)
+                        continue
+
+                    # ── Rate limit ─────────────────────────────────────────────
+                    if status == 429:
+                        logging.warning("2FA: rate limited (429), backing off %dms", PAUSE_MS_429)
+                        page.wait_for_timeout(PAUSE_MS_429)
+                        continue
+
+                    # ── Обычная пауза между итерациями ────────────────────────
+                    page.wait_for_timeout(PAUSE_MS_NORMAL)
+
+                except Exception as e:
+                    logging.warning("2FA iter#%d err: %s", iteration, e)
+                    page.wait_for_timeout(PAUSE_MS_NORMAL)
+
+            browser.close()
+
+    except Exception as e:
+        logging.error("2FA Playwright error: %s", e)
+
     return None
 
 
@@ -1032,124 +1040,45 @@ def get_link_via_api(cookie, method):
         return None
 
 
-def extract_link_from_api(data, raw_text: str = ""):
-    """
-    Максимально агрессивный парсер ссылки верификации.
-    Использует 4 стратегии параллельно — не пропустит ни один формат.
-
-    Стратегия 1: прямые поля JSON (известные ключи)
-    Стратегия 2: рекурсивный обход всего JSON дерева
-    Стратегия 3: regex по сырому тексту ответа (withpersona.com URL)
-    Стратегия 4: собираем URL из inquiryId + sessionToken
-    """
-    # ── Стратегия 1: прямые известные поля ────────────────────────────────────
-    DIRECT_KEYS = [
-        "verificationUrl", "redirectUrl", "url", "link", "personaUrl",
-        "inquiryUrl", "sessionUrl", "verifyUrl", "verification_url",
-        "redirect_url", "persona_url", "inquiry_url",
-    ]
-    if isinstance(data, dict):
-        for key in DIRECT_KEYS:
-            val = data.get(key, "")
-            if val and isinstance(val, str) and (
-                "withpersona.com" in val or
-                "inquiry-id=" in val or
-                ("verify" in val and val.startswith("https://"))
-            ):
-                logging.info("[LINK] Strategy1 key=%s url=%s", key, val[:120])
-                return val
-
-    # ── Стратегия 2: рекурсивный обход JSON ───────────────────────────────────
-    _inq_id = [None]
-    _session_tok = [None]
-
-    def _walk(obj):
-        if isinstance(obj, str):
-            if ("withpersona.com" in obj and len(obj) > 30) or "inquiry-id=" in obj:
-                return obj
-            if obj.startswith("inq_") and len(obj) > 8:
-                _inq_id[0] = obj
-            # ищем длинный токен сессии
-            if len(obj) > 40 and re.match(r'^[A-Za-z0-9_\-]{40,}$', obj):
-                _session_tok[0] = obj
-        elif isinstance(obj, dict):
-            # сначала проверяем приоритетные ключи
-            for key in DIRECT_KEYS + ["inquiryId", "inquiry_id", "sessionToken",
-                                       "session_token", "token", "sessionIdentifier"]:
-                if key in obj:
-                    r = _walk(obj[key])
-                    if r and "http" in r:
-                        return r
-            # потом остальные
-            for k, v in obj.items():
-                if k not in DIRECT_KEYS:
-                    r = _walk(v)
-                    if r and "http" in r:
-                        return r
-        elif isinstance(obj, list):
-            for item in obj:
-                r = _walk(item)
-                if r and "http" in r:
-                    return r
+def extract_link_from_api(data):
+    """Ищем ссылку в JSON ответе"""
+    if not isinstance(data, dict):
         return None
 
-    if isinstance(data, dict):
-        found = _walk(data)
-        if found:
-            logging.info("[LINK] Strategy2 recursive: %s", found[:120])
-            return found
+    # Прямые поля
+    for key in ["verificationUrl", "redirectUrl", "url", "link",
+                "personaUrl", "inquiryUrl", "sessionUrl"]:
+        val = data.get(key, "")
+        if val and "withpersona.com" in val:
+            return val
 
-    # ── Стратегия 3: regex по сырому тексту ───────────────────────────────────
-    text_to_scan = raw_text
-    if not text_to_scan and isinstance(data, dict):
-        try:
-            import json as _j
-            text_to_scan = _j.dumps(data)
-        except Exception:
-            pass
+    # Строим из inquiry-id если есть
+    inq_id = data.get("inquiryId") or data.get("inquiry_id") or data.get("sessionIdentifier")
+    session_token = data.get("sessionToken") or data.get("session_token")
 
-    if text_to_scan:
-        # Ищем полный URL с withpersona.com
-        urls = re.findall(r'https?://[^\s"\'<>\\]+withpersona\.com[^\s"\'<>\\]*', text_to_scan)
-        for url in urls:
-            url = url.rstrip('\\/')
-            if "inquiry-id=" in url or "verify" in url:
-                logging.info("[LINK] Strategy3 regex url: %s", url[:120])
-                return url
-
-        # Ищем inquiry-id= прямо в тексте
-        m = re.search(r'inquiry-id=(inq_[A-Za-z0-9]+)', text_to_scan)
-        if m:
-            inq = m.group(1)
-            tok_m = re.search(r'session[-_]?token["\s:=]+([A-Za-z0-9_\-]{40,})', text_to_scan, re.I)
-            link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq
-            if tok_m:
-                link += "&session-token=" + tok_m.group(1)
-            logging.info("[LINK] Strategy3 inq regex: %s", link[:120])
-            return link
-
-    # ── Стратегия 4: собираем из inquiryId + sessionToken ─────────────────────
-    inq_id = None
-    sess_tok = None
-    if isinstance(data, dict):
-        inq_id = (data.get("inquiryId") or data.get("inquiry_id") or
-                  data.get("sessionIdentifier") or _inq_id[0])
-        sess_tok = (data.get("sessionToken") or data.get("session_token") or
-                    data.get("token") or _session_tok[0])
-
-    if text_to_scan and not inq_id:
-        m = re.search(r'(inq_[A-Za-z0-9]{8,})', text_to_scan)
-        if m:
-            inq_id = m.group(1)
-
-    if inq_id:
-        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
-        if sess_tok and len(str(sess_tok)) > 20:
-            link += "&session-token=" + str(sess_tok)
-        logging.info("[LINK] Strategy4 build: %s", link[:120])
+    if inq_id and inq_id.startswith("inq_"):
+        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+        if session_token:
+            link += "&session-token=" + session_token
         return link
 
-    return None
+    # Ищем рекурсивно
+    def find_deep(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
+                    return v
+                result = find_deep(v)
+                if result:
+                    return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = find_deep(item)
+                if result:
+                    return result
+        return None
+
+    return find_deep(data)
 
 
 def playwright_get_url(cookie, method):
@@ -1252,6 +1181,91 @@ def check_invoice(invoice_id):
         return data["result"]["items"][0] if data.get("ok") and data["result"]["items"] else None
     except Exception:
         return None
+
+
+# ===== XROCKET =====
+
+def xrocket_create(amount_usd, attempts):
+    if not XROCKET_TOKEN:
+        return None
+    try:
+        r = requests.post(
+            "https://pay.xrocket.tg/tg-invoices",
+            headers={"Rocket-Pay-Key": XROCKET_TOKEN, "Content-Type": "application/json"},
+            json={
+                "currency":    "USDT",
+                "amount":      round(amount_usd, 2),
+                "description": f"Покупка {attempts} попыток",
+                "expiredIn":   300,
+                "numPayments": 1,
+            },
+            timeout=10,
+        )
+        d = r.json()
+        if d.get("success"):
+            return {"invoice_id": str(d["data"]["id"]), "pay_url": d["data"]["link"]}
+        logging.error("xRocket create: %s", d)
+    except Exception as e:
+        logging.error("xRocket create error: %s", e)
+    return None
+
+
+def xrocket_check(invoice_id):
+    if not XROCKET_TOKEN:
+        return None
+    try:
+        r = requests.get(
+            f"https://pay.xrocket.tg/tg-invoices/{invoice_id}",
+            headers={"Rocket-Pay-Key": XROCKET_TOKEN},
+            timeout=10,
+        )
+        d = r.json()
+        if d.get("success"):
+            return d["data"].get("status")  # 'active' | 'paid' | 'expired'
+    except Exception as e:
+        logging.error("xRocket check error: %s", e)
+    return None
+
+
+# ===== LZT MARKET =====
+
+def lzt_create(amount_usd, attempts):
+    if not LZT_TOKEN:
+        return None
+    amount_rub = round(amount_usd * LZT_RATE, 2)
+    try:
+        r = requests.post(
+            "https://lzt.market/invoice/create",
+            headers={"Authorization": f"Bearer {LZT_TOKEN}", "Content-Type": "application/json"},
+            json={"amount": amount_rub, "currency": "rub",
+                  "comment": f"Покупка {attempts} попыток", "ttl": 300},
+            timeout=10,
+        )
+        d = r.json()
+        inv_id  = d.get("invoiceId") or d.get("invoice_id")
+        pay_url = d.get("paymentLink") or d.get("payment_link") or d.get("url")
+        if inv_id and pay_url:
+            return {"invoice_id": str(inv_id), "pay_url": pay_url, "rub": amount_rub}
+        logging.error("LZT create: %s", d)
+    except Exception as e:
+        logging.error("LZT create error: %s", e)
+    return None
+
+
+def lzt_check(invoice_id):
+    if not LZT_TOKEN:
+        return None
+    try:
+        r = requests.get(
+            f"https://lzt.market/invoice/{invoice_id}",
+            headers={"Authorization": f"Bearer {LZT_TOKEN}"},
+            timeout=10,
+        )
+        d = r.json()
+        return d.get("status") or d.get("invoiceStatus")  # 'paid' | 'pending' | 'expired'
+    except Exception as e:
+        logging.error("LZT check error: %s", e)
+    return None
 
 
 # ===== ЛОГИ =====
@@ -1415,49 +1429,130 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_BUY
 
-    if data.startswith("buy_"):
-        count = int(data.split("_")[1])
+    # ── Шаг 1: выбрали кол-во → показываем выбор способа оплаты ──────────────
+    if data.startswith("buy_") and not data.startswith("buy_pay_"):
+        count    = int(data.split("_")[1])
         discount = DISCOUNTS.get(count, 0)
-        total = round(count * PRICE * (1 - discount), 2)
-        await query.edit_message_text("Создаю инвойс...")
-        invoice = create_invoice(total, count)
+        total    = round(count * PRICE * (1 - discount), 2)
+        rub      = round(total * LZT_RATE)
+
+        btns = []
+        if CRYPTO_BOT_TOKEN:
+            btns.append([InlineKeyboardButton(
+                t(user_id, "btn_cryptobot"),
+                callback_data=f"buy_pay_cb_{count}"
+            )])
+        if XROCKET_TOKEN:
+            btns.append([InlineKeyboardButton(
+                t(user_id, "btn_xrocket"),
+                callback_data=f"buy_pay_xr_{count}"
+            )])
+        if LZT_TOKEN:
+            btns.append([InlineKeyboardButton(
+                t(user_id, "btn_lzt", rub=rub),
+                callback_data=f"buy_pay_lzt_{count}"
+            )])
+        if not btns:
+            # Если ни один провайдер не настроен — фоллбэк CryptoBot
+            btns.append([InlineKeyboardButton(
+                t(user_id, "btn_cryptobot"),
+                callback_data=f"buy_pay_cb_{count}"
+            )])
+        btns.append([InlineKeyboardButton(t(user_id, "btn_back"), callback_data="buy")])
+
+        await query.edit_message_text(
+            t(user_id, "choose_pay_method", count=count, usd=total),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(btns),
+        )
+        return WAITING_BUY
+
+    # ── Шаг 2: выбрали способ → создаём инвойс ────────────────────────────────
+    if data.startswith("buy_pay_"):
+        # buy_pay_<provider>_<count>
+        parts    = data.split("_")   # ['buy','pay','cb','5']
+        provider = parts[2]
+        count    = int(parts[3])
+        discount = DISCOUNTS.get(count, 0)
+        total    = round(count * PRICE * (1 - discount), 2)
+
+        await query.edit_message_text(t(user_id, "creating_invoice"))
+
+        invoice = None
+        if provider == "cb":
+            raw = create_invoice(total, count)
+            if raw:
+                invoice = {"invoice_id": str(raw["invoice_id"]), "pay_url": raw["pay_url"], "label": "CryptoBot"}
+        elif provider == "xr":
+            raw = xrocket_create(total, count)
+            if raw:
+                invoice = {**raw, "label": "xRocket"}
+        elif provider == "lzt":
+            raw = lzt_create(total, count)
+            if raw:
+                amount_show = f"~{raw['rub']}₽"
+                invoice = {**raw, "label": "Lolz Market", "amount_show": amount_show}
+
         if not invoice:
             await query.edit_message_text(
                 t(user_id, "pay_error"),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="buy")]])
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(t(user_id, "btn_back"), callback_data=f"buy_{count}")
+                ]])
             )
             return WAITING_MENU
-        invoice_id = str(invoice["invoice_id"])
-        pay_url = invoice["pay_url"]
-        pending_payments[invoice_id] = {"user_id": user_id, "attempts": count, "total": total}
+
+        inv_key = f"{provider}_{invoice['invoice_id']}"
+        pending_payments[inv_key] = {"user_id": user_id, "attempts": count,
+                                     "total": total, "provider": provider}
+
+        amount_show = invoice.get("amount_show", f"${total}")
         await query.edit_message_text(
-            t(user_id, "invoice_created", amount=total, attempts=count),
+            t(user_id, "invoice_created", amount=amount_show, attempts=count),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(t(user_id, "btn_pay"), url=pay_url)],
-                [InlineKeyboardButton(t(user_id, "btn_check_pay"), callback_data="check_" + invoice_id)],
-                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data="buy")],
+                [InlineKeyboardButton(t(user_id, "btn_pay"), url=invoice["pay_url"])],
+                [InlineKeyboardButton(t(user_id, "btn_check_pay"), callback_data=f"check_{inv_key}")],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data=f"buy_{count}")],
             ])
         )
         return WAITING_PAYMENT
 
+    # ── Шаг 3: проверка оплаты ────────────────────────────────────────────────
     if data.startswith("check_"):
-        invoice_id = data.replace("check_", "")
-        invoice = check_invoice(invoice_id)
-        if invoice and invoice.get("status") == "paid":
-            payment = pending_payments.pop(invoice_id, None)
+        inv_key  = data[6:]                          # убираем "check_"
+        payment  = pending_payments.get(inv_key, {})
+        provider = payment.get("provider", "cb")
+        raw_id   = inv_key.split("_", 1)[1]         # убираем "cb_" / "xr_" / "lzt_"
+
+        paid = False
+        if provider == "cb":
+            inv = check_invoice(raw_id)
+            paid = bool(inv and inv.get("status") == "paid")
+        elif provider == "xr":
+            paid = (xrocket_check(raw_id) == "paid")
+        elif provider == "lzt":
+            paid = (lzt_check(raw_id) == "paid")
+
+        if paid:
+            payment = pending_payments.pop(inv_key, None)
             if payment:
-                cnt = payment["attempts"]
-                total = payment.get("total", cnt * PRICE)
+                cnt          = payment["attempts"]
+                total        = payment.get("total", cnt * PRICE)
                 db_upsert_user(user_id, username, attempts_delta=cnt, spent_delta=total)
                 new_attempts = db_get_attempts(user_id)
                 await query.edit_message_text(
                     t(user_id, "pay_ok", attempts=cnt, total=new_attempts),
                     parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")]])
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(t(user_id, "btn_back"), callback_data="main_menu")
+                    ]])
                 )
             else:
-                await query.answer("Already processed!" if db_get_lang(user_id) == "en" else "Уже обработано!", show_alert=True)
+                await query.answer(
+                    "Already processed!" if db_get_lang(user_id) == "en" else "Уже обработано!",
+                    show_alert=True
+                )
         else:
             await query.answer(t(user_id, "pay_pending"), show_alert=True)
         return WAITING_MENU
