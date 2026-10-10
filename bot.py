@@ -726,200 +726,184 @@ TWO_FA_JS = """
 """
 
 
+def _2fa_single_request(cookie, csrf=None, arkose_token=None):
+    """
+    Один HTTP-запрос к Roblox age-verification без браузера.
+    Возвращает (status, body_text, csrf_from_header, challenge_type, challenge_id).
+    """
+    import json as _j
+    URL = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
+    BODY = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
+    headers = {
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Content-Type":  "application/json;charset=utf-8",
+        "Origin":        "https://www.roblox.com",
+        "Referer":       "https://www.roblox.com/my/account#!/info",
+        "Accept":        "application/json, text/plain, */*",
+    }
+    if csrf:
+        headers["x-csrf-token"] = csrf
+    if arkose_token:
+        headers["rblx-challenge-metadata"] = _j.dumps({
+            "unifiedCaptchaId": "", "dataExchangeBlob": "", "arkoseToken": arkose_token
+        })
+        headers["rblx-challenge-id"]   = ""
+        headers["rblx-challenge-type"] = "arkose"
+
+    s = requests.Session()
+    s.cookies[".ROBLOSECURITY"] = cookie
+    s.proxies.update(get_proxy())
+    try:
+        r = s.post(URL, json=BODY, headers=headers, timeout=10)
+        return (
+            r.status_code,
+            r.text,
+            r.headers.get("x-csrf-token", ""),
+            r.headers.get("rblx-challenge-type", ""),
+            r.headers.get("rblx-challenge-id", ""),
+        )
+    except Exception as e:
+        logging.warning("_2fa_single_request error: %s", e)
+        return (0, "", "", "", "")
+
+
+def _2fa_do_pair(cookie):
+    """
+    2 параллельных запроса: сначала получаем CSRF, потом шлём с ним.
+    Возвращает dict с status/body/csrf/challengeType.
+    """
+    import concurrent.futures as _cf
+    import json as _j
+
+    # Шаг 1: 2 параллельных запроса без CSRF — получаем токены
+    with _cf.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(_2fa_single_request, cookie, None)
+        f2 = ex.submit(_2fa_single_request, cookie, None)
+        s1, b1, csrf1, ct1, ci1 = f1.result()
+        s2, b2, csrf2, ct2, ci2 = f2.result()
+
+    # Если уже 200 без CSRF — удача
+    for s, b, ct in [(s1, b1, ct1), (s2, b2, ct2)]:
+        if s == 200:
+            return {"status": s, "body": b, "csrf": "", "challengeType": ct}
+
+    # Берём любой csrf что пришёл
+    csrf = csrf1 or csrf2
+
+    if not csrf:
+        # Нет CSRF — возвращаем что есть
+        best = (s1, b1, ct1, csrf1) if (ct1 or s1 != 0) else (s2, b2, ct2, csrf2)
+        return {"status": best[0], "body": best[1], "challengeType": best[2], "csrf": best[3]}
+
+    # Шаг 2: 2 параллельных запроса с CSRF
+    with _cf.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(_2fa_single_request, cookie, csrf)
+        f2 = ex.submit(_2fa_single_request, cookie, csrf)
+        s1, b1, csrf1, ct1, ci1 = f1.result()
+        s2, b2, csrf2, ct2, ci2 = f2.result()
+
+    # Первый успешный
+    if s1 == 200:
+        return {"status": s1, "body": b1, "challengeType": ct1, "csrf": csrf1 or csrf}
+    if s2 == 200:
+        return {"status": s2, "body": b2, "challengeType": ct2, "csrf": csrf2 or csrf}
+
+    # Оба не 200 — возвращаем тот где есть challengeType
+    if ct1:
+        return {"status": s1, "body": b1, "challengeType": ct1, "csrf": csrf1 or csrf}
+    return {"status": s2, "body": b2, "challengeType": ct2, "csrf": csrf2 or csrf}
+
+
 def get_url_via_api_2fa(cookie, method):
     """
-    Для 2FA endpoint требует браузерный контекст (Challenge required на прямых запросах).
-    Используем Playwright — открываем страницу с cookie, выполняем JS прямо в браузере.
+    2FA bypass полностью на requests — БЕЗ Playwright и Chromium.
+    RAM: ~5MB вместо ~400MB. CPU: минимум.
 
-    Скорость: 2 параллельных запроса каждые ~400ms = 120-150 запросов в минуту.
-
-    JS_FETCH_DUAL — делает 2 fetch одновременно через Promise.all, возвращает
-    результат первого успешного (status 200) или последнего если оба не 200.
+    Скорость: 2 параллельных запроса каждые ~400ms ≈ 120-150 req/min.
+    Каждая итерация = пара (получить CSRF + запрос с CSRF) × 2 потока.
     """
     import time as _t
-    import json as _json
+    import json as _j
 
-    # ── 2 параллельных запроса за один вызов evaluate ──────────────────────────
-    # Каждый сам получает CSRF (1й запрос без токена → берёт csrf из заголовка →
-    # 2й запрос с csrf). Оба идут одновременно через Promise.all.
-    # Возвращает первый успешный (status=200) или любой с challengeType если нет успеха.
-    JS_FETCH_DUAL = """
-async () => {
-  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+    PAUSE_NORMAL   = 0.4   # сек между итерациями (норма)
+    PAUSE_2FA_WAIT = 3.0   # ожидание подтверждения 2FA пользователем
+    PAUSE_429      = 5.0   # rate limit
+    PAUSE_ARKOSE   = 1.0   # после решения капчи
 
-  const doRequest = async () => {
-    const send = (csrf) => fetch(URL_TARGET, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json;charset=utf-8',
-        ...(csrf ? { 'x-csrf-token': csrf } : {}),
-      },
-      body: BODY,
-    });
+    deadline      = _t.time() + 600  # 10 минут
+    iteration     = 0
+    total_req     = 0
+    start_time    = _t.time()
 
-    let r = await send(null);
-    const csrf = r.headers.get('x-csrf-token');
-    if (csrf) r = await send(csrf);
+    while _t.time() < deadline:
+        iteration += 1
+        total_req += 4  # каждая итерация = 4 HTTP запроса (2×без csrf + 2×с csrf)
 
-    const text = await r.text();
-    return {
-      status: r.status,
-      body: text,
-      csrf,
-      challengeType: r.headers.get('rblx-challenge-type') || '',
-      challengeId:   r.headers.get('rblx-challenge-id')   || '',
-    };
-  };
+        try:
+            result         = _2fa_do_pair(cookie)
+            status         = result.get("status", 0)
+            body           = result.get("body", "")
+            csrf           = result.get("csrf", "")
+            challenge_type = result.get("challengeType") or ""
 
-  // Запускаем 2 запроса параллельно
-  const [r1, r2] = await Promise.all([doRequest(), doRequest()]);
-
-  // Возвращаем первый успешный, иначе r1
-  if (r1.status === 200) return r1;
-  if (r2.status === 200) return r2;
-  // Если ни один не успешен — вернём тот, у которого есть challengeType
-  return r1.challengeType ? r1 : r2;
-}
-"""
-
-    # JS для отправки запроса с аркоз токеном
-    JS_WITH_ARKOSE = """
-async (arkoseToken, csrf) => {
-  const url = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
-
-  const r = await fetch(url, {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      'x-csrf-token': csrf,
-      'rblx-challenge-metadata': JSON.stringify({ unifiedCaptchaId: '', dataExchangeBlob: '', arkoseToken }),
-      'rblx-challenge-id': '',
-      'rblx-challenge-type': 'arkose',
-    },
-    body,
-  });
-
-  return { status: r.status, body: await r.text() };
-}
-"""
-
-    # ── Расчёт паузы ────────────────────────────────────────────────────────────
-    # 2 запроса за итерацию, пауза 400ms между итерациями.
-    # Каждый doRequest() = 2 fetch внутри (~100-200ms каждый), итого ~300-400ms на выполнение.
-    # 400ms пауза после = ~700-800ms на цикл → 2 req / 0.75s ≈ 160 req/min (в пределах 120-150).
-    PAUSE_MS_NORMAL   = 400   # пауза между итерациями (нормальный режим)
-    PAUSE_MS_2FA_WAIT = 3000  # пауза при ожидании подтверждения 2FA пользователем
-    PAUSE_MS_429      = 5000  # пауза при rate-limit
-    PAUSE_MS_ARKOSE   = 1000  # пауза после попытки аркоза
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800},
-                proxy=get_proxy_url(),
+            elapsed = _t.time() - start_time
+            rpm = (total_req / elapsed * 60) if elapsed > 0 else 0
+            logging.info(
+                "2FA iter#%d | req=%d | ~%.0f req/min | status=%d | challenge=%s | body=%s",
+                iteration, total_req, rpm, status, challenge_type, body[:120],
             )
-            ctx.add_cookies([{
-                "name": ".ROBLOSECURITY",
-                "value": cookie,
-                "domain": ".roblox.com",
-                "path": "/",
-            }])
-            page = ctx.new_page()
-            page.goto("https://www.roblox.com/my/account#!/info",
-                      wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
 
-            deadline = _t.time() + 600  # 10 минут
-            iteration = 0
-            total_requests = 0
-
-            while _t.time() < deadline:
-                if page.is_closed():
-                    break
-                iteration += 1
-                total_requests += 2  # каждая итерация = 2 параллельных запроса
-
+            # ── Успех ─────────────────────────────────────────────────────────
+            if status == 200:
                 try:
-                    result = page.evaluate(JS_FETCH_DUAL)
-                    status         = result.get("status")
-                    body           = result.get("body", "")
-                    csrf           = result.get("csrf")
-                    challenge_type = result.get("challengeType") or ""
+                    data = _j.loads(body)
+                except Exception:
+                    data = {}
+                link = extract_link_from_api(data)
+                if link:
+                    logging.info("2FA: got link iter#%d total_req=%d", iteration, total_req)
+                    return link
 
-                    elapsed = _t.time() - (deadline - 600)
-                    rps = total_requests / elapsed if elapsed > 0 else 0
-                    logging.info(
-                        "2FA iter#%d | total_req=%d | ~%.0f req/min | status=%d | challenge=%s | body=%s",
-                        iteration, total_requests, rps * 60, status, challenge_type, body[:120]
-                    )
+            # ── Ожидание 2FA подтверждения ────────────────────────────────────
+            if status == 403 and "twostepverification" in challenge_type.lower():
+                logging.info("2FA: waiting twostep confirm from user...")
+                _t.sleep(PAUSE_2FA_WAIT)
+                continue
 
-                    # ── Успех ──────────────────────────────────────────────────
-                    if status == 200:
+            # ── Arkose FunCaptcha ──────────────────────────────────────────────
+            if status == 403 and CAP_GURU_KEY and "arkose" in challenge_type.lower():
+                logging.info("2FA: arkose detected, solving via cap.guru...")
+                arkose_token = capguru_solve_funcaptcha(
+                    public_key="476068BF-9607-4799-B53D-966BE98E2B81",
+                    page_url="https://www.roblox.com",
+                    proxy=get_proxy(),
+                )
+                if arkose_token and csrf:
+                    s2, b2, _, _, _ = _2fa_single_request(cookie, csrf, arkose_token)
+                    logging.info("2FA arkose result: status=%d body=%s", s2, b2[:200])
+                    if s2 == 200:
                         try:
-                            data = _json.loads(body)
+                            data = _j.loads(b2)
                         except Exception:
                             data = {}
                         link = extract_link_from_api(data)
                         if link:
-                            logging.info("2FA: got link on iter#%d (total %d requests)", iteration, total_requests)
-                            browser.close()
+                            logging.info("2FA: got link via cap.guru iter#%d", iteration)
                             return link
+                _t.sleep(PAUSE_ARKOSE)
+                continue
 
-                    # ── Ожидание подтверждения 2FA пользователем ───────────────
-                    if status == 403 and "twostepverification" in challenge_type.lower():
-                        logging.info("2FA: waiting for user twostep confirm...")
-                        page.wait_for_timeout(PAUSE_MS_2FA_WAIT)
-                        continue
+            # ── Rate limit ────────────────────────────────────────────────────
+            if status == 429:
+                logging.warning("2FA: 429 rate limit, sleep %.1fs", PAUSE_429)
+                _t.sleep(PAUSE_429)
+                continue
 
-                    # ── Arkose FunCaptcha ──────────────────────────────────────
-                    if status == 403 and CAP_GURU_KEY and challenge_type and "arkose" in challenge_type.lower():
-                        logging.info("2FA: arkose challenge, solving via cap.guru...")
-                        arkose_token = capguru_solve_funcaptcha(
-                            public_key="476068BF-9607-4799-B53D-966BE98E2B81",
-                            page_url="https://www.roblox.com",
-                            proxy=get_proxy(),
-                        )
-                        if arkose_token and csrf:
-                            r2 = page.evaluate(JS_WITH_ARKOSE, arkose_token, csrf)
-                            s2 = r2.get("status")
-                            b2 = r2.get("body", "")
-                            logging.info("2FA arkose result: status=%d body=%s", s2, b2[:200])
-                            if s2 == 200:
-                                try:
-                                    data = _json.loads(b2)
-                                except Exception:
-                                    data = {}
-                                link = extract_link_from_api(data)
-                                if link:
-                                    logging.info("2FA: got link via cap.guru on iter#%d", iteration)
-                                    browser.close()
-                                    return link
-                        page.wait_for_timeout(PAUSE_MS_ARKOSE)
-                        continue
+            _t.sleep(PAUSE_NORMAL)
 
-                    # ── Rate limit ─────────────────────────────────────────────
-                    if status == 429:
-                        logging.warning("2FA: rate limited (429), backing off %dms", PAUSE_MS_429)
-                        page.wait_for_timeout(PAUSE_MS_429)
-                        continue
-
-                    # ── Обычная пауза между итерациями ────────────────────────
-                    page.wait_for_timeout(PAUSE_MS_NORMAL)
-
-                except Exception as e:
-                    logging.warning("2FA iter#%d err: %s", iteration, e)
-                    page.wait_for_timeout(PAUSE_MS_NORMAL)
-
-            browser.close()
-
-    except Exception as e:
-        logging.error("2FA Playwright error: %s", e)
+        except Exception as e:
+            logging.warning("2FA iter#%d exception: %s", iteration, e)
+            _t.sleep(PAUSE_NORMAL)
 
     return None
 
