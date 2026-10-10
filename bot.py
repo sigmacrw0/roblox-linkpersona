@@ -127,9 +127,7 @@ def get_proxy_url():
 
 BOT_TOKEN        = os.environ.get("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.environ.get("CRYPTO_BOT_TOKEN", "")
-XROCKET_TOKEN    = os.environ.get("XROCKET_TOKEN", "")
-LZT_TOKEN        = os.environ.get("LZT_TOKEN", "")
-LZT_RATE         = float(os.environ.get("LZT_RATE", "92.0"))
+
 ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "0").split(",")))
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")  # ID канала для логов
 
@@ -385,8 +383,6 @@ TEXTS = {
         "pay_error": "Ошибка создания счёта!",
         "choose_pay_method": "💳 *Выберите способ оплаты:*\n\n*{count}* попыток — *${usd}*",
         "btn_cryptobot": "🤖 CryptoBot (USDT)",
-        "btn_xrocket":   "🚀 xRocket (USDT/TON)",
-        "btn_lzt":       "🟡 Lolz Market (~{rub}₽)",
         "creating_invoice": "⏳ Создаю счёт...",
         "lang_choose": "🌐 Выберите язык / Choose language:",
         "lang_set": "✅ Язык установлен: Русский",
@@ -471,8 +467,6 @@ TEXTS = {
         "pay_error": "Invoice creation error!",
         "choose_pay_method": "💳 *Choose payment method:*\n\n*{count}* attempts — *${usd}*",
         "btn_cryptobot": "🤖 CryptoBot (USDT)",
-        "btn_xrocket":   "🚀 xRocket (USDT/TON)",
-        "btn_lzt":       "🟡 Lolz Market (~{rub}₽)",
         "creating_invoice": "⏳ Creating invoice...",
         "lang_choose": "🌐 Выберите язык / Choose language:",
         "lang_set": "✅ Language set: English",
@@ -752,48 +746,39 @@ def get_url_via_api_2fa(cookie, method):
     import time as _t
     import json as _json
 
-    # ── 2 параллельных запроса за один вызов evaluate ──────────────────────────
-    # Каждый сам получает CSRF (1й запрос без токена → берёт csrf из заголовка →
-    # 2й запрос с csrf). Оба идут одновременно через Promise.all.
-    # Возвращает первый успешный (status=200) или любой с challengeType если нет успеха.
-    JS_FETCH_DUAL = """
+    # ── 1 запрос за итерацию, CSRF кешируется между вызовами через window.__csrf ──
+    # Цель: 50 req/min = 1 запрос каждые 1200ms.
+    # При первом вызове (csrf=null) получаем CSRF из заголовка и сохраняем в window.__csrf.
+    # Последующие вызовы сразу используют кешированный CSRF — 1 fetch вместо 2.
+    JS_FETCH_SINGLE = """
 async () => {
   const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
   const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-  const doRequest = async () => {
-    const send = (csrf) => fetch(URL_TARGET, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json;charset=utf-8',
-        ...(csrf ? { 'x-csrf-token': csrf } : {}),
-      },
-      body: BODY,
-    });
+  const csrf = window.__csrf || null;
 
-    let r = await send(null);
-    const csrf = r.headers.get('x-csrf-token');
-    if (csrf) r = await send(csrf);
+  const r = await fetch(URL_TARGET, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      ...(csrf ? { 'x-csrf-token': csrf } : {}),
+    },
+    body: BODY,
+  });
 
-    const text = await r.text();
-    return {
-      status: r.status,
-      body: text,
-      csrf,
-      challengeType: r.headers.get('rblx-challenge-type') || '',
-      challengeId:   r.headers.get('rblx-challenge-id')   || '',
-    };
+  // Сохраняем CSRF для следующих итераций
+  const newCsrf = r.headers.get('x-csrf-token');
+  if (newCsrf) window.__csrf = newCsrf;
+
+  const text = await r.text();
+  return {
+    status: r.status,
+    body: text,
+    csrf: window.__csrf || null,
+    challengeType: r.headers.get('rblx-challenge-type') || '',
+    challengeId:   r.headers.get('rblx-challenge-id')   || '',
   };
-
-  // Запускаем 2 запроса параллельно
-  const [r1, r2] = await Promise.all([doRequest(), doRequest()]);
-
-  // Возвращаем первый успешный, иначе r1
-  if (r1.status === 200) return r1;
-  if (r2.status === 200) return r2;
-  // Если ни один не успешен — вернём тот, у которого есть challengeType
-  return r1.challengeType ? r1 : r2;
 }
 """
 
@@ -820,14 +805,12 @@ async (arkoseToken, csrf) => {
 }
 """
 
-    # ── Расчёт паузы ────────────────────────────────────────────────────────────
-    # 2 запроса за итерацию, пауза между итерациями.
-    # Целевой rate: 75 req/min = 75/2 = 37.5 итерации/мин → 1600ms на итерацию.
-    # Каждый doRequest() занимает ~200-400ms, поэтому пауза = 1600 - 400 = 1200ms.
-    # Итого: 2 req / 1.6s = 75 req/min.
-    PAUSE_MS_NORMAL   = 1200  # пауза между итерациями → целевой rate 75 req/min
-    PAUSE_MS_2FA_WAIT = 3000  # пауза при ожидании подтверждения 2FA пользователем
-    PAUSE_MS_429      = 5000  # пауза при rate-limit
+    # ── Паузы ───────────────────────────────────────────────────────────────────
+    # Цель: 50 req/min = 1 запрос каждые 1200ms.
+    # fetch занимает ~100-200ms, поэтому пауза после = 1000ms → итого ~1200ms/цикл.
+    PAUSE_MS_NORMAL   = 1000  # пауза между итерациями → ~50 req/min
+    PAUSE_MS_2FA_WAIT = 2000  # пауза при ожидании подтверждения 2FA
+    PAUSE_MS_429      = 2000  # короткая пауза при rate-limit (не 5000!)
     PAUSE_MS_ARKOSE   = 1000  # пауза после попытки аркоза
 
     try:
@@ -857,10 +840,10 @@ async (arkoseToken, csrf) => {
                 if page.is_closed():
                     break
                 iteration += 1
-                total_requests += 2  # каждая итерация = 2 параллельных запроса
+                total_requests += 1  # 1 запрос за итерацию
 
                 try:
-                    result = page.evaluate(JS_FETCH_DUAL)
+                    result = page.evaluate(JS_FETCH_SINGLE)
                     status         = result.get("status")
                     body           = result.get("body", "")
                     csrf           = result.get("csrf")
@@ -1184,133 +1167,7 @@ def check_invoice(invoice_id):
         return None
 
 
-# ===== XROCKET =====
 
-def xrocket_create(amount_usd, attempts):
-    """
-    Docs: https://pay.xrocket.tg/docs
-    POST /tg-invoices
-    Header: Rocket-Pay-Key: <token>
-    """
-    if not XROCKET_TOKEN:
-        return None
-    try:
-        r = requests.post(
-            "https://pay.xrocket.tg/tg-invoices",
-            headers={
-                "Rocket-Pay-Key": XROCKET_TOKEN,
-                "Content-Type": "application/json",
-            },
-            json={
-                "currency":    "USDT",
-                "amount":      round(amount_usd, 2),
-                "description": f"Покупка {attempts} попыток",
-                "expiredIn":   300,
-            },
-            timeout=10,
-        )
-        logging.info("xRocket create status=%d body=%s", r.status_code, r.text[:300])
-        d = r.json()
-        # Ответ: {"success": true, "data": {"id": "...", "link": "https://t.me/..."}}
-        if d.get("success") and d.get("data"):
-            inv_id  = d["data"].get("id") or d["data"].get("invoiceId")
-            pay_url = d["data"].get("link") or d["data"].get("payUrl") or d["data"].get("url")
-            if inv_id and pay_url:
-                return {
-                    "invoice_id": str(inv_id),
-                    "pay_url":    pay_url,
-                }
-        logging.error("xRocket create failed: %s", d)
-    except Exception as e:
-        logging.error("xRocket error: %s", e)
-    return None
-
-
-def xrocket_check(invoice_id):
-    """GET /tg-invoices/<id>"""
-    if not XROCKET_TOKEN:
-        return None
-    try:
-        r = requests.get(
-            f"https://pay.xrocket.tg/tg-invoices/{invoice_id}",
-            headers={"Rocket-Pay-Key": XROCKET_TOKEN},
-            timeout=10,
-        )
-        logging.info("xRocket check status=%d body=%s", r.status_code, r.text[:200])
-        d = r.json()
-        if d.get("success") and d.get("data"):
-            return d["data"].get("status")  # 'active' | 'paid' | 'expired'
-    except Exception as e:
-        logging.error("xRocket check error: %s", e)
-    return None
-
-
-# ===== LZT MARKET =====
-
-def lzt_create(amount_usd, attempts):
-    """
-    Docs: https://lzt.market/developer  (раздел Payments)
-    POST https://lzt.market/api/payments/create
-    Header: Authorization: Bearer <token>
-    """
-    if not LZT_TOKEN:
-        return None
-    amount_rub = round(amount_usd * LZT_RATE, 2)
-    try:
-        r = requests.post(
-            "https://lzt.market/api/payments/create",
-            headers={
-                "Authorization": f"Bearer {LZT_TOKEN}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={
-                "amount":      int(amount_rub),
-                "comment":     f"Покупка {attempts} попыток",
-                "redirect_url": "",
-            },
-            timeout=15,
-        )
-        logging.info("LZT create status=%d body=%s", r.status_code, r.text[:500])
-        if not r.text.strip():
-            logging.error("LZT create: empty response")
-            return None
-        d = r.json()
-        # Ответ: {"status": 1, "data": {"id": "...", "link": "https://lzt.market/..."}}
-        data = d.get("data") or d
-        inv_id  = (data.get("id") or data.get("invoiceId") or data.get("invoice_id"))
-        pay_url = (data.get("link") or data.get("url") or data.get("payUrl")
-                   or data.get("paymentLink") or data.get("payment_link"))
-        if inv_id and pay_url:
-            return {"invoice_id": str(inv_id), "pay_url": pay_url, "rub": amount_rub}
-        logging.error("LZT create failed: %s", d)
-    except Exception as e:
-        logging.error("LZT error: %s", e)
-    return None
-
-
-def lzt_check(invoice_id):
-    """GET https://lzt.market/api/payments/<id>"""
-    if not LZT_TOKEN:
-        return None
-    try:
-        r = requests.get(
-            f"https://lzt.market/api/payments/{invoice_id}",
-            headers={"Authorization": f"Bearer {LZT_TOKEN}"},
-            timeout=10,
-        )
-        logging.info("LZT check status=%d body=%s", r.status_code, r.text[:200])
-        if not r.text.strip():
-            return None
-        d = r.json()
-        data = d.get("data") or d
-        status = data.get("status") or data.get("invoiceStatus")
-        # LZT возвращает status: "success"/"paid" или числовой статус
-        if isinstance(status, int):
-            return "paid" if status == 1 else "pending"
-        return status
-    except Exception as e:
-        logging.error("LZT check error: %s", e)
-    return None
 
 
 # ===== ЛОГИ =====
@@ -1474,47 +1331,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_BUY
 
-    # Шаг 1 — выбрали кол-во → показываем способы оплаты
+    # Шаг 1 — выбрали кол-во → сразу создаём инвойс CryptoBot
     if data.startswith("buy_") and not data.startswith("buy_pay_"):
         count    = int(data.split("_")[1])
         discount = DISCOUNTS.get(count, 0)
         total    = round(count * PRICE * (1 - discount), 2)
-        rub      = round(total * LZT_RATE)
-        btns = []
-        if CRYPTO_BOT_TOKEN:
-            btns.append([InlineKeyboardButton(t(user_id, "btn_cryptobot"),  callback_data=f"buy_pay_cb_{count}")])
-        if XROCKET_TOKEN:
-            btns.append([InlineKeyboardButton(t(user_id, "btn_xrocket"),    callback_data=f"buy_pay_xr_{count}")])
-        if LZT_TOKEN:
-            btns.append([InlineKeyboardButton(t(user_id, "btn_lzt", rub=rub), callback_data=f"buy_pay_lzt_{count}")])
-        if not btns:
-            btns.append([InlineKeyboardButton(t(user_id, "btn_cryptobot"),  callback_data=f"buy_pay_cb_{count}")])
-        btns.append([InlineKeyboardButton(t(user_id, "btn_back"), callback_data="buy")])
-        await query.edit_message_text(
-            t(user_id, "choose_pay_method", count=count, usd=total),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(btns),
-        )
-        return WAITING_BUY
-
-    # Шаг 2 — выбрали способ → создаём инвойс
-    if data.startswith("buy_pay_"):
-        parts    = data.split("_")   # ['buy','pay','cb','1']
-        provider = parts[2]
-        count    = int(parts[3])
-        discount = DISCOUNTS.get(count, 0)
-        total    = round(count * PRICE * (1 - discount), 2)
         await query.edit_message_text(t(user_id, "creating_invoice"))
 
-        invoice = None
-        if provider == "cb":
-            raw = create_invoice(total, count)
-            if raw:
-                invoice = {"invoice_id": str(raw["invoice_id"]), "pay_url": raw["pay_url"]}
-        elif provider == "xr":
-            invoice = xrocket_create(total, count)
-        elif provider == "lzt":
-            invoice = lzt_create(total, count)
+        raw = create_invoice(total, count)
+        invoice = {"invoice_id": str(raw["invoice_id"]), "pay_url": raw["pay_url"]} if raw else None
 
         if not invoice:
             await query.edit_message_text(
@@ -1523,35 +1348,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return WAITING_MENU
 
-        inv_key = f"{provider}_{invoice['invoice_id']}"
-        pending_payments[inv_key] = {"user_id": user_id, "attempts": count, "total": total, "provider": provider}
-        amount_show = f"~{invoice['rub']}₽" if provider == "lzt" else f"${total}"
+        inv_key = f"cb_{invoice['invoice_id']}"
+        pending_payments[inv_key] = {"user_id": user_id, "attempts": count, "total": total, "provider": "cb"}
         await query.edit_message_text(
-            t(user_id, "invoice_created", amount=amount_show, attempts=count),
+            t(user_id, "invoice_created", amount=f"${total}", attempts=count),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(t(user_id, "btn_pay"), url=invoice["pay_url"])],
                 [InlineKeyboardButton(t(user_id, "btn_check_pay"), callback_data=f"check_{inv_key}")],
-                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data=f"buy_{count}")],
+                [InlineKeyboardButton(t(user_id, "btn_back"), callback_data=f"buy")],
             ]),
         )
         return WAITING_PAYMENT
 
-    # Шаг 3 — проверка оплаты
+    # Проверка оплаты
     if data.startswith("check_"):
-        inv_key  = data[6:]
-        payment  = pending_payments.get(inv_key, {})
-        provider = payment.get("provider", "cb")
-        raw_id   = "_".join(inv_key.split("_")[1:])   # убираем префикс cb_ / xr_ / lzt_
+        inv_key = data[6:]
+        payment = pending_payments.get(inv_key, {})
+        raw_id  = "_".join(inv_key.split("_")[1:])   # убираем префикс cb_
 
-        paid = False
-        if provider == "cb":
-            inv  = check_invoice(raw_id)
-            paid = bool(inv and inv.get("status") == "paid")
-        elif provider == "xr":
-            paid = (xrocket_check(raw_id) == "paid")
-        elif provider == "lzt":
-            paid = (lzt_check(raw_id) == "paid")
+        inv  = check_invoice(raw_id)
+        paid = bool(inv and inv.get("status") == "paid")
 
         if paid:
             payment = pending_payments.pop(inv_key, None)
