@@ -730,47 +730,57 @@ def get_url_via_api_2fa(cookie, method):
     """
     Для 2FA endpoint требует браузерный контекст (Challenge required на прямых запросах).
     Используем Playwright — открываем страницу с cookie, выполняем JS прямо в браузере.
-    JS делает fetch() изнутри браузера — обходит challenge автоматически.
-    Повторяем JS до 60 раз пока не получим ссылку.
+
+    Скорость: 2 параллельных запроса каждые ~400ms = 120-150 запросов в минуту.
+
+    JS_FETCH_DUAL — делает 2 fetch одновременно через Promise.all, возвращает
+    результат первого успешного (status 200) или последнего если оба не 200.
     """
     import time as _t
+    import json as _json
 
-    # JS для получения CSRF и выполнения запроса
-    JS_FETCH = """
+    # ── 2 параллельных запроса за один вызов evaluate ──────────────────────────
+    # Каждый сам получает CSRF (1й запрос без токена → берёт csrf из заголовка →
+    # 2й запрос с csrf). Оба идут одновременно через Promise.all.
+    # Возвращает первый успешный (status=200) или любой с challengeType если нет успеха.
+    JS_FETCH_DUAL = """
 async () => {
-  const url  = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+  const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-  const send = (csrf, arkoseToken) => fetch(url, {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      ...(csrf        ? { 'x-csrf-token': csrf } : {}),
-      ...(arkoseToken ? { 'rblx-challenge-metadata': JSON.stringify({unifiedCaptchaId:'', dataExchangeBlob:'', arkoseToken}) } : {}),
-    },
-    body,
-  });
+  const doRequest = async () => {
+    const send = (csrf) => fetch(URL_TARGET, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json;charset=utf-8',
+        ...(csrf ? { 'x-csrf-token': csrf } : {}),
+      },
+      body: BODY,
+    });
 
-  let r = await send(null, null);
-  const csrf = r.headers.get('x-csrf-token');
-  const challengeId = r.headers.get('rblx-challenge-id');
-  const challengeType = r.headers.get('rblx-challenge-type');
+    let r = await send(null);
+    const csrf = r.headers.get('x-csrf-token');
+    if (csrf) r = await send(csrf);
 
-  if (csrf) r = await send(csrf, null);
-
-  const text = await r.text();
-  const status2 = r.status;
-  const challengeId2 = r.headers.get('rblx-challenge-id');
-  const challengeType2 = r.headers.get('rblx-challenge-type');
-
-  return {
-    status: status2,
-    body: text,
-    csrf,
-    challengeId: challengeId2 || challengeId,
-    challengeType: challengeType2 || challengeType,
+    const text = await r.text();
+    return {
+      status: r.status,
+      body: text,
+      csrf,
+      challengeType: r.headers.get('rblx-challenge-type') || '',
+      challengeId:   r.headers.get('rblx-challenge-id')   || '',
+    };
   };
+
+  // Запускаем 2 запроса параллельно
+  const [r1, r2] = await Promise.all([doRequest(), doRequest()]);
+
+  // Возвращаем первый успешный, иначе r1
+  if (r1.status === 200) return r1;
+  if (r2.status === 200) return r2;
+  // Если ни один не успешен — вернём тот, у которого есть challengeType
+  return r1.challengeType ? r1 : r2;
 }
 """
 
@@ -797,7 +807,14 @@ async (arkoseToken, csrf) => {
 }
 """
 
-    import json as _json
+    # ── Расчёт паузы ────────────────────────────────────────────────────────────
+    # 2 запроса за итерацию, пауза 400ms между итерациями.
+    # Каждый doRequest() = 2 fetch внутри (~100-200ms каждый), итого ~300-400ms на выполнение.
+    # 400ms пауза после = ~700-800ms на цикл → 2 req / 0.75s ≈ 160 req/min (в пределах 120-150).
+    PAUSE_MS_NORMAL   = 400   # пауза между итерациями (нормальный режим)
+    PAUSE_MS_2FA_WAIT = 3000  # пауза при ожидании подтверждения 2FA пользователем
+    PAUSE_MS_429      = 5000  # пауза при rate-limit
+    PAUSE_MS_ARKOSE   = 1000  # пауза после попытки аркоза
 
     try:
         with sync_playwright() as p:
@@ -818,25 +835,31 @@ async (arkoseToken, csrf) => {
                       wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
 
-            import time as _t
             deadline = _t.time() + 600  # 10 минут
-            attempt = 0
+            iteration = 0
+            total_requests = 0
 
             while _t.time() < deadline:
                 if page.is_closed():
                     break
-                attempt += 1
+                iteration += 1
+                total_requests += 2  # каждая итерация = 2 параллельных запроса
+
                 try:
-                    result = page.evaluate(JS_FETCH)
+                    result = page.evaluate(JS_FETCH_DUAL)
                     status         = result.get("status")
                     body           = result.get("body", "")
                     csrf           = result.get("csrf")
-                    challenge_id   = result.get("challengeId")
                     challenge_type = result.get("challengeType") or ""
-                    logging.info("2FA attempt#%d status=%d challenge=%s body=%s",
-                                 attempt, status, challenge_type, body[:200])
 
-                    # Успех
+                    elapsed = _t.time() - (deadline - 600)
+                    rps = total_requests / elapsed if elapsed > 0 else 0
+                    logging.info(
+                        "2FA iter#%d | total_req=%d | ~%.0f req/min | status=%d | challenge=%s | body=%s",
+                        iteration, total_requests, rps * 60, status, challenge_type, body[:120]
+                    )
+
+                    # ── Успех ──────────────────────────────────────────────────
                     if status == 200:
                         try:
                             data = _json.loads(body)
@@ -844,17 +867,17 @@ async (arkoseToken, csrf) => {
                             data = {}
                         link = extract_link_from_api(data)
                         if link:
-                            logging.info("2FA: got link on attempt#%d", attempt)
+                            logging.info("2FA: got link on iter#%d (total %d requests)", iteration, total_requests)
                             browser.close()
                             return link
 
-                    # twostepverification — ждём пока пользователь подтвердит email/app
+                    # ── Ожидание подтверждения 2FA пользователем ───────────────
                     if status == 403 and "twostepverification" in challenge_type.lower():
-                        logging.info("2FA: twostepverification detected, waiting for user to confirm...")
-                        page.wait_for_timeout(4000)
+                        logging.info("2FA: waiting for user twostep confirm...")
+                        page.wait_for_timeout(PAUSE_MS_2FA_WAIT)
                         continue
 
-                    # Arkose FunCaptcha — решаем через cap.guru
+                    # ── Arkose FunCaptcha ──────────────────────────────────────
                     if status == 403 and CAP_GURU_KEY and challenge_type and "arkose" in challenge_type.lower():
                         logging.info("2FA: arkose challenge, solving via cap.guru...")
                         arkose_token = capguru_solve_funcaptcha(
@@ -874,21 +897,24 @@ async (arkoseToken, csrf) => {
                                     data = {}
                                 link = extract_link_from_api(data)
                                 if link:
-                                    logging.info("2FA: got link via cap.guru on attempt#%d", attempt)
+                                    logging.info("2FA: got link via cap.guru on iter#%d", iteration)
                                     browser.close()
                                     return link
-                        page.wait_for_timeout(1000)
+                        page.wait_for_timeout(PAUSE_MS_ARKOSE)
                         continue
 
-                    # 429 — притормозить
+                    # ── Rate limit ─────────────────────────────────────────────
                     if status == 429:
-                        page.wait_for_timeout(4000)
-                    else:
-                        page.wait_for_timeout(800)
+                        logging.warning("2FA: rate limited (429), backing off %dms", PAUSE_MS_429)
+                        page.wait_for_timeout(PAUSE_MS_429)
+                        continue
+
+                    # ── Обычная пауза между итерациями ────────────────────────
+                    page.wait_for_timeout(PAUSE_MS_NORMAL)
 
                 except Exception as e:
-                    logging.warning("2FA attempt#%d err: %s", attempt, e)
-                    page.wait_for_timeout(1000)
+                    logging.warning("2FA iter#%d err: %s", iteration, e)
+                    page.wait_for_timeout(PAUSE_MS_NORMAL)
 
             browser.close()
 
