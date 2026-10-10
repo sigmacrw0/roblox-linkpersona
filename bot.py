@@ -17,6 +17,74 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 
+# ===== CAP.GURU =====
+CAP_GURU_KEY = os.environ.get("CAP_GURU_KEY", "")  # вставь ключ сюда или в env
+
+def capguru_solve_funcaptcha(public_key: str, page_url: str, proxy: dict = None) -> str | None:
+    """
+    Решает FunCaptcha (Arkose Labs) через cap.guru (AntiCaptcha-совместимый API).
+    Возвращает token или None.
+    """
+    if not CAP_GURU_KEY:
+        logging.warning("CAP_GURU_KEY не задан")
+        return None
+
+    try:
+        # Создаём задачу
+        task = {
+            "type": "FunCaptchaTaskProxyless",
+            "websiteURL": page_url,
+            "websitePublicKey": public_key,
+        }
+        if proxy:
+            # Если хотим с прокси
+            host_port = proxy.get("https", "").replace("http://", "")
+            if "@" in host_port:
+                creds, hp = host_port.rsplit("@", 1)
+                user, pwd = creds.split(":", 1)
+                host, port = hp.rsplit(":", 1)
+                task["type"] = "FunCaptchaTask"
+                task["proxyType"] = "http"
+                task["proxyAddress"] = host
+                task["proxyPort"] = int(port)
+                task["proxyLogin"] = user
+                task["proxyPassword"] = pwd
+
+        r = requests.post("https://api.cap.guru/createTask", json={
+            "clientKey": CAP_GURU_KEY,
+            "task": task,
+        }, timeout=15)
+        data = r.json()
+        task_id = data.get("taskId")
+        if not task_id:
+            logging.error("cap.guru createTask failed: %s", data)
+            return None
+
+        logging.info("cap.guru task created: %s", task_id)
+
+        # Поллим результат до 120 сек
+        import time as _t
+        for _ in range(24):
+            _t.sleep(5)
+            r2 = requests.post("https://api.cap.guru/getTaskResult", json={
+                "clientKey": CAP_GURU_KEY,
+                "taskId": task_id,
+            }, timeout=15)
+            res = r2.json()
+            status = res.get("status")
+            logging.info("cap.guru poll: %s", status)
+            if status == "ready":
+                token = res.get("solution", {}).get("token")
+                logging.info("cap.guru token: %s", (token or "")[:60])
+                return token
+            if status == "failed" or res.get("errorId"):
+                logging.error("cap.guru failed: %s", res)
+                return None
+
+    except Exception as e:
+        logging.error("cap.guru error: %s", e)
+    return None
+
 # ===== ПРОКСИ =====
 # Формат: host:port:user:pass
 _PROXY_LIST = [
@@ -658,133 +726,162 @@ TWO_FA_JS = """
 """
 
 
-def _2fa_worker(cookie, stop_event, result_box, proxy_entry, worker_id):
-    import time as _t
-    url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
-    body_data = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-
-    host, port, user, passwd = proxy_entry.split(":")
-    proxy = {
-        "http":  f"http://{user}:{passwd}@{host}:{port}",
-        "https": f"http://{user}:{passwd}@{host}:{port}",
-    }
-    cookies_jar = {".ROBLOSECURITY": cookie}
-
-    # Разносим старты воркеров чтобы не все разом
-    _t.sleep(worker_id * 0.3)
-
-    deadline = _t.time() + 120
-    req_num = 0
-    csrf = None
-
-    while not stop_event.is_set() and _t.time() < deadline:
-        try:
-            # Шаг 1: получаем CSRF (только если ещё нет или протух)
-            if not csrf:
-                h1 = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                    "Content-Type": "application/json;charset=utf-8",
-                    "Origin": "https://www.roblox.com",
-                    "Referer": "https://www.roblox.com/my/account#!/info",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Sec-Fetch-Site": "same-site",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Dest": "empty",
-                }
-                r1 = requests.post(url, json=body_data, headers=h1,
-                                   cookies=cookies_jar, proxies=proxy, timeout=10)
-                req_num += 1
-                csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-                logging.info("w#%d req#%d r1=%d csrf=%s", worker_id, req_num, r1.status_code, bool(csrf))
-
-                if r1.status_code == 200:
-                    link = _extract_api_url(r1)
-                    if link and not stop_event.is_set():
-                        stop_event.set()
-                        result_box.append(link)
-                        return
-
-                if r1.status_code == 429:
-                    csrf = None
-                    _t.sleep(5)
-                    continue
-
-                if not csrf:
-                    _t.sleep(2)
-                    continue
-
-            # Шаг 2: шлём с CSRF — основной запрос
-            h2 = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                "Content-Type": "application/json;charset=utf-8",
-                "Origin": "https://www.roblox.com",
-                "Referer": "https://www.roblox.com/my/account#!/info",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Fetch-Site": "same-site",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "x-csrf-token": csrf,
-            }
-            r2 = requests.post(url, json=body_data, headers=h2,
-                               cookies=cookies_jar, proxies=proxy, timeout=10)
-            req_num += 1
-            logging.info("w#%d req#%d r2=%d body=%s", worker_id, req_num, r2.status_code, r2.text[:300])
-
-            if r2.status_code == 200:
-                link = _extract_api_url(r2)
-                if link and not stop_event.is_set():
-                    stop_event.set()
-                    result_box.append(link)
-                    return
-
-            if r2.status_code == 429:
-                # Слишком часто — ждём и сбрасываем CSRF
-                csrf = None
-                _t.sleep(5)
-                continue
-
-            if r2.status_code == 403:
-                # Challenge — пробуем снова с новым CSRF
-                csrf = r2.headers.get("x-csrf-token") or csrf
-                _t.sleep(1)
-                continue
-
-            # Успешный цикл — небольшая пауза перед следующим
-            _t.sleep(0.8)
-
-        except Exception as e:
-            logging.warning("w#%d err: %s", worker_id, e)
-            csrf = None
-            _t.sleep(1)
-
-    logging.info("w#%d done, total reqs: %d", worker_id, req_num)
-
-
 def get_url_via_api_2fa(cookie, method):
     """
-    10 воркеров по одному на прокси, старты разнесены на 0.3 сек.
-    Каждый воркер переиспользует CSRF и шлёт ~75 запросов в минуту.
+    Для 2FA endpoint требует браузерный контекст (Challenge required на прямых запросах).
+    Используем Playwright — открываем страницу с cookie, выполняем JS прямо в браузере.
+    JS делает fetch() изнутри браузера — обходит challenge автоматически.
+    Повторяем JS до 60 раз пока не получим ссылку.
     """
-    from concurrent.futures import ThreadPoolExecutor
-    import threading
+    import time as _t
 
-    stop_event = threading.Event()
-    result_box = []
+    # JS для получения CSRF и выполнения запроса
+    JS_FETCH = """
+async () => {
+  const url  = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-    with ThreadPoolExecutor(max_workers=len(_PROXY_LIST)) as pool:
-        futures = [
-            pool.submit(_2fa_worker, cookie, stop_event, result_box, entry, i + 1)
-            for i, entry in enumerate(_PROXY_LIST)
-        ]
-        stop_event.wait(timeout=125)
+  const send = (csrf, arkoseToken) => fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      ...(csrf        ? { 'x-csrf-token': csrf } : {}),
+      ...(arkoseToken ? { 'rblx-challenge-metadata': JSON.stringify({unifiedCaptchaId:'', dataExchangeBlob:'', arkoseToken}) } : {}),
+    },
+    body,
+  });
 
-    if result_box:
-        logging.info("2FA: success")
-        return result_box[0]
+  let r = await send(null, null);
+  const csrf = r.headers.get('x-csrf-token');
+  const challengeId = r.headers.get('rblx-challenge-id');
+  const challengeType = r.headers.get('rblx-challenge-type');
 
-    logging.error("2FA: all workers exhausted")
+  if (csrf) r = await send(csrf, null);
+
+  const text = await r.text();
+  const status2 = r.status;
+  const challengeId2 = r.headers.get('rblx-challenge-id');
+  const challengeType2 = r.headers.get('rblx-challenge-type');
+
+  return {
+    status: status2,
+    body: text,
+    csrf,
+    challengeId: challengeId2 || challengeId,
+    challengeType: challengeType2 || challengeType,
+  };
+}
+"""
+
+    # JS для отправки запроса с аркоз токеном
+    JS_WITH_ARKOSE = """
+async (arkoseToken, csrf) => {
+  const url = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
+  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+
+  const r = await fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json;charset=utf-8',
+      'x-csrf-token': csrf,
+      'rblx-challenge-metadata': JSON.stringify({ unifiedCaptchaId: '', dataExchangeBlob: '', arkoseToken }),
+      'rblx-challenge-id': '',
+      'rblx-challenge-type': 'arkose',
+    },
+    body,
+  });
+
+  return { status: r.status, body: await r.text() };
+}
+"""
+
+    import json as _json
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                proxy=get_proxy_url(),
+            )
+            ctx.add_cookies([{
+                "name": ".ROBLOSECURITY",
+                "value": cookie,
+                "domain": ".roblox.com",
+                "path": "/",
+            }])
+            page = ctx.new_page()
+            page.goto("https://www.roblox.com/my/account#!/info",
+                      wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            for attempt in range(60):
+                if page.is_closed():
+                    break
+                try:
+                    result = page.evaluate(JS_FETCH)
+                    status       = result.get("status")
+                    body         = result.get("body", "")
+                    csrf         = result.get("csrf")
+                    challenge_id = result.get("challengeId")
+                    challenge_type = result.get("challengeType", "")
+                    logging.info("2FA attempt#%d status=%d challenge=%s body=%s",
+                                 attempt + 1, status, challenge_type, body[:200])
+
+                    # Успех
+                    if status == 200:
+                        try:
+                            data = _json.loads(body)
+                        except Exception:
+                            data = {}
+                        link = extract_link_from_api(data)
+                        if link:
+                            logging.info("2FA: got link on attempt#%d", attempt + 1)
+                            browser.close()
+                            return link
+
+                    # Challenge (403 с arkose) — решаем через cap.guru
+                    if status == 403 and CAP_GURU_KEY and ("arkose" in challenge_type.lower() or challenge_id):
+                        logging.info("2FA: challenge detected, solving via cap.guru...")
+                        arkose_token = capguru_solve_funcaptcha(
+                            public_key="476068BF-9607-4799-B53D-966BE98E2B81",  # Roblox Arkose public key
+                            page_url="https://www.roblox.com",
+                            proxy=get_proxy(),
+                        )
+                        if arkose_token and csrf:
+                            logging.info("2FA: got arkose token, sending with it...")
+                            r2 = page.evaluate(JS_WITH_ARKOSE, arkose_token, csrf)
+                            s2   = r2.get("status")
+                            b2   = r2.get("body", "")
+                            logging.info("2FA arkose result: status=%d body=%s", s2, b2[:200])
+                            if s2 == 200:
+                                try:
+                                    data = _json.loads(b2)
+                                except Exception:
+                                    data = {}
+                                link = extract_link_from_api(data)
+                                if link:
+                                    logging.info("2FA: got link via cap.guru on attempt#%d", attempt + 1)
+                                    browser.close()
+                                    return link
+
+                    if status == 429:
+                        page.wait_for_timeout(3000)
+                    else:
+                        page.wait_for_timeout(800)
+
+                except Exception as e:
+                    logging.warning("2FA attempt#%d err: %s", attempt + 1, e)
+                    page.wait_for_timeout(1000)
+
+            browser.close()
+
+    except Exception as e:
+        logging.error("2FA Playwright error: %s", e)
+
     return None
 
 
