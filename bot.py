@@ -821,10 +821,11 @@ async (arkoseToken, csrf) => {
 """
 
     # ── Расчёт паузы ────────────────────────────────────────────────────────────
-    # 2 запроса за итерацию, пауза 400ms между итерациями.
-    # Каждый doRequest() = 2 fetch внутри (~100-200ms каждый), итого ~300-400ms на выполнение.
-    # 400ms пауза после = ~700-800ms на цикл → 2 req / 0.75s ≈ 160 req/min (в пределах 120-150).
-    PAUSE_MS_NORMAL   = 400   # пауза между итерациями (нормальный режим)
+    # 2 запроса за итерацию, пауза между итерациями.
+    # Целевой rate: 75 req/min = 75/2 = 37.5 итерации/мин → 1600ms на итерацию.
+    # Каждый doRequest() занимает ~200-400ms, поэтому пауза = 1600 - 400 = 1200ms.
+    # Итого: 2 req / 1.6s = 75 req/min.
+    PAUSE_MS_NORMAL   = 1200  # пауза между итерациями → целевой rate 75 req/min
     PAUSE_MS_2FA_WAIT = 3000  # пауза при ожидании подтверждения 2FA пользователем
     PAUSE_MS_429      = 5000  # пауза при rate-limit
     PAUSE_MS_ARKOSE   = 1000  # пауза после попытки аркоза
@@ -1188,16 +1189,16 @@ def check_invoice(invoice_id):
 def xrocket_create(amount_usd, attempts):
     """
     Docs: https://pay.xrocket.tg/docs
-    POST /app/invoice/create
-    Header: rocket-pay-key: <token>
+    POST /tg-invoices
+    Header: Rocket-Pay-Key: <token>
     """
     if not XROCKET_TOKEN:
         return None
     try:
         r = requests.post(
-            "https://pay.xrocket.tg/app/invoice/create",
+            "https://pay.xrocket.tg/tg-invoices",
             headers={
-                "rocket-pay-key": XROCKET_TOKEN,
+                "Rocket-Pay-Key": XROCKET_TOKEN,
                 "Content-Type": "application/json",
             },
             json={
@@ -1212,10 +1213,13 @@ def xrocket_create(amount_usd, attempts):
         d = r.json()
         # Ответ: {"success": true, "data": {"id": "...", "link": "https://t.me/..."}}
         if d.get("success") and d.get("data"):
-            return {
-                "invoice_id": str(d["data"]["id"]),
-                "pay_url":    d["data"]["link"],
-            }
+            inv_id  = d["data"].get("id") or d["data"].get("invoiceId")
+            pay_url = d["data"].get("link") or d["data"].get("payUrl") or d["data"].get("url")
+            if inv_id and pay_url:
+                return {
+                    "invoice_id": str(inv_id),
+                    "pay_url":    pay_url,
+                }
         logging.error("xRocket create failed: %s", d)
     except Exception as e:
         logging.error("xRocket error: %s", e)
@@ -1223,16 +1227,16 @@ def xrocket_create(amount_usd, attempts):
 
 
 def xrocket_check(invoice_id):
-    """GET /app/invoice/info?id=<id>"""
+    """GET /tg-invoices/<id>"""
     if not XROCKET_TOKEN:
         return None
     try:
         r = requests.get(
-            "https://pay.xrocket.tg/app/invoice/info",
-            headers={"rocket-pay-key": XROCKET_TOKEN},
-            params={"id": invoice_id},
+            f"https://pay.xrocket.tg/tg-invoices/{invoice_id}",
+            headers={"Rocket-Pay-Key": XROCKET_TOKEN},
             timeout=10,
         )
+        logging.info("xRocket check status=%d body=%s", r.status_code, r.text[:200])
         d = r.json()
         if d.get("success") and d.get("data"):
             return d["data"].get("status")  # 'active' | 'paid' | 'expired'
@@ -1246,7 +1250,7 @@ def xrocket_check(invoice_id):
 def lzt_create(amount_usd, attempts):
     """
     Docs: https://lzt.market/developer  (раздел Payments)
-    POST https://api.lzt.market/market/user/payments/invoice
+    POST https://lzt.market/api/payments/create
     Header: Authorization: Bearer <token>
     """
     if not LZT_TOKEN:
@@ -1254,24 +1258,28 @@ def lzt_create(amount_usd, attempts):
     amount_rub = round(amount_usd * LZT_RATE, 2)
     try:
         r = requests.post(
-            "https://api.lzt.market/market/user/payments/invoice",
+            "https://lzt.market/api/payments/create",
             headers={
                 "Authorization": f"Bearer {LZT_TOKEN}",
-                "Content-Type": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
             },
-            json={
-                "amount":   amount_rub,
-                "currency": "rub",
-                "comment":  f"Покупка {attempts} попыток",
+            data={
+                "amount":      int(amount_rub),
+                "comment":     f"Покупка {attempts} попыток",
+                "redirect_url": "",
             },
-            timeout=10,
+            timeout=15,
         )
-        logging.info("LZT create status=%d body=%s", r.status_code, r.text[:300])
+        logging.info("LZT create status=%d body=%s", r.status_code, r.text[:500])
+        if not r.text.strip():
+            logging.error("LZT create: empty response")
+            return None
         d = r.json()
-        # Ответ: {"invoiceId": "...", "payUrl": "https://lzt.market/..."}
-        inv_id  = d.get("invoiceId") or d.get("invoice_id") or d.get("id")
-        pay_url = (d.get("payUrl") or d.get("paymentLink")
-                   or d.get("payment_link") or d.get("url") or d.get("link"))
+        # Ответ: {"status": 1, "data": {"id": "...", "link": "https://lzt.market/..."}}
+        data = d.get("data") or d
+        inv_id  = (data.get("id") or data.get("invoiceId") or data.get("invoice_id"))
+        pay_url = (data.get("link") or data.get("url") or data.get("payUrl")
+                   or data.get("paymentLink") or data.get("payment_link"))
         if inv_id and pay_url:
             return {"invoice_id": str(inv_id), "pay_url": pay_url, "rub": amount_rub}
         logging.error("LZT create failed: %s", d)
@@ -1281,17 +1289,25 @@ def lzt_create(amount_usd, attempts):
 
 
 def lzt_check(invoice_id):
-    """GET https://api.lzt.market/market/user/payments/invoice/<id>"""
+    """GET https://lzt.market/api/payments/<id>"""
     if not LZT_TOKEN:
         return None
     try:
         r = requests.get(
-            f"https://api.lzt.market/market/user/payments/invoice/{invoice_id}",
+            f"https://lzt.market/api/payments/{invoice_id}",
             headers={"Authorization": f"Bearer {LZT_TOKEN}"},
             timeout=10,
         )
+        logging.info("LZT check status=%d body=%s", r.status_code, r.text[:200])
+        if not r.text.strip():
+            return None
         d = r.json()
-        return d.get("status") or d.get("invoiceStatus")  # 'paid' | 'pending' | 'expired'
+        data = d.get("data") or d
+        status = data.get("status") or data.get("invoiceStatus")
+        # LZT возвращает status: "success"/"paid" или числовой статус
+        if isinstance(status, int):
+            return "paid" if status == 1 else "pending"
+        return status
     except Exception as e:
         logging.error("LZT check error: %s", e)
     return None
