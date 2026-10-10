@@ -659,56 +659,74 @@ TWO_FA_JS = """
 
 
 def _2fa_worker(cookie, stop_event, result_box, proxy_entry, worker_id):
-    """
-    Один воркер на один прокси. Крутится до 2 минут.
-    Между итерациями пауза 1.2 сек чтобы не словить 429.
-    """
     import time as _t
     url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
     body_data = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
-    deadline = _t.time() + 120
 
-    # Фиксированный прокси для этого воркера
     host, port, user, passwd = proxy_entry.split(":")
-    proxy = {"http": f"http://{user}:{passwd}@{host}:{port}", "https": f"http://{user}:{passwd}@{host}:{port}"}
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json;charset=utf-8",
-        "Origin": "https://www.roblox.com",
-        "Referer": "https://www.roblox.com/my/account#!/info",
+    proxy = {
+        "http":  f"http://{user}:{passwd}@{host}:{port}",
+        "https": f"http://{user}:{passwd}@{host}:{port}",
     }
     cookies_jar = {".ROBLOSECURITY": cookie}
+
+    # Разносим старты воркеров чтобы не все разом
+    _t.sleep(worker_id * 0.3)
+
+    deadline = _t.time() + 120
     req_num = 0
+    csrf = None
 
     while not stop_event.is_set() and _t.time() < deadline:
         try:
-            req_num += 1
+            # Шаг 1: получаем CSRF (только если ещё нет или протух)
+            if not csrf:
+                h1 = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                    "Content-Type": "application/json;charset=utf-8",
+                    "Origin": "https://www.roblox.com",
+                    "Referer": "https://www.roblox.com/my/account#!/info",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Fetch-Site": "same-site",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Dest": "empty",
+                }
+                r1 = requests.post(url, json=body_data, headers=h1,
+                                   cookies=cookies_jar, proxies=proxy, timeout=10)
+                req_num += 1
+                csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
+                logging.info("w#%d req#%d r1=%d csrf=%s", worker_id, req_num, r1.status_code, bool(csrf))
 
-            # Запрос 1: без CSRF → получаем токен
-            r1 = requests.post(url, json=body_data, headers=headers.copy(),
-                               cookies=cookies_jar, proxies=proxy, timeout=10)
-            csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-            logging.info("w#%d req#%d r1=%d csrf=%s", worker_id, req_num, r1.status_code, bool(csrf))
+                if r1.status_code == 200:
+                    link = _extract_api_url(r1)
+                    if link and not stop_event.is_set():
+                        stop_event.set()
+                        result_box.append(link)
+                        return
 
-            if r1.status_code == 200:
-                link = _extract_api_url(r1)
-                if link and not stop_event.is_set():
-                    stop_event.set()
-                    result_box.append(link)
-                    return
+                if r1.status_code == 429:
+                    csrf = None
+                    _t.sleep(5)
+                    continue
 
-            if r1.status_code == 429:
-                _t.sleep(3)
-                continue
+                if not csrf:
+                    _t.sleep(2)
+                    continue
 
-            if stop_event.is_set() or not csrf:
-                _t.sleep(1.2)
-                continue
-
-            # Запрос 2: с CSRF → ссылка
-            h2 = headers.copy()
-            h2["x-csrf-token"] = csrf
+            # Шаг 2: шлём с CSRF — основной запрос
+            h2 = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                "Content-Type": "application/json;charset=utf-8",
+                "Origin": "https://www.roblox.com",
+                "Referer": "https://www.roblox.com/my/account#!/info",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Fetch-Site": "same-site",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+                "x-csrf-token": csrf,
+            }
             r2 = requests.post(url, json=body_data, headers=h2,
                                cookies=cookies_jar, proxies=proxy, timeout=10)
             req_num += 1
@@ -722,14 +740,23 @@ def _2fa_worker(cookie, stop_event, result_box, proxy_entry, worker_id):
                     return
 
             if r2.status_code == 429:
-                _t.sleep(3)
+                # Слишком часто — ждём и сбрасываем CSRF
+                csrf = None
+                _t.sleep(5)
                 continue
 
-            # Пауза между итерациями — ~5 запросов в секунду на воркер
-            _t.sleep(1.2)
+            if r2.status_code == 403:
+                # Challenge — пробуем снова с новым CSRF
+                csrf = r2.headers.get("x-csrf-token") or csrf
+                _t.sleep(1)
+                continue
+
+            # Успешный цикл — небольшая пауза перед следующим
+            _t.sleep(0.8)
 
         except Exception as e:
             logging.warning("w#%d err: %s", worker_id, e)
+            csrf = None
             _t.sleep(1)
 
     logging.info("w#%d done, total reqs: %d", worker_id, req_num)
@@ -737,9 +764,8 @@ def _2fa_worker(cookie, stop_event, result_box, proxy_entry, worker_id):
 
 def get_url_via_api_2fa(cookie, method):
     """
-    10 воркеров — по одному на каждый прокси.
-    Каждый воркер делает ~50 запросов в минуту (пауза 1.2 сек).
-    Итого: 10 × 50 = ~500 запросов в минуту без 429.
+    10 воркеров по одному на прокси, старты разнесены на 0.3 сек.
+    Каждый воркер переиспользует CSRF и шлёт ~75 запросов в минуту.
     """
     from concurrent.futures import ThreadPoolExecutor
     import threading
