@@ -658,27 +658,38 @@ TWO_FA_JS = """
 """
 
 
-def _2fa_worker(cookie, stop_event, result_box, worker_id):
+def _2fa_worker(cookie, stop_event, result_box, proxy_entry, worker_id):
+    """
+    Один воркер на один прокси. Крутится до 2 минут.
+    Между итерациями пауза 1.2 сек чтобы не словить 429.
+    """
     import time as _t
     url = "https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification"
     body_data = {"generateLink": True, "ageEstimation": True, "parentVerification": False}
     deadline = _t.time() + 120
 
+    # Фиксированный прокси для этого воркера
+    host, port, user, passwd = proxy_entry.split(":")
+    proxy = {"http": f"http://{user}:{passwd}@{host}:{port}", "https": f"http://{user}:{passwd}@{host}:{port}"}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/json;charset=utf-8",
+        "Origin": "https://www.roblox.com",
+        "Referer": "https://www.roblox.com/my/account#!/info",
+    }
+    cookies_jar = {".ROBLOSECURITY": cookie}
+    req_num = 0
+
     while not stop_event.is_set() and _t.time() < deadline:
         try:
-            proxy = get_proxy()
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/json;charset=utf-8",
-                "Origin": "https://www.roblox.com",
-                "Referer": "https://www.roblox.com/my/account#!/info",
-            }
-            cookies = {".ROBLOSECURITY": cookie}
+            req_num += 1
 
-            # Запрос 1: без CSRF
-            r1 = requests.post(url, json=body_data, headers=headers, cookies=cookies, proxies=proxy, timeout=5)
+            # Запрос 1: без CSRF → получаем токен
+            r1 = requests.post(url, json=body_data, headers=headers.copy(),
+                               cookies=cookies_jar, proxies=proxy, timeout=10)
             csrf = r1.headers.get("x-csrf-token") or r1.headers.get("X-Csrf-Token")
-            logging.info("w#%d r1=%d csrf=%s body=%s", worker_id, r1.status_code, bool(csrf), r1.text[:200])
+            logging.info("w#%d req#%d r1=%d csrf=%s", worker_id, req_num, r1.status_code, bool(csrf))
 
             if r1.status_code == 200:
                 link = _extract_api_url(r1)
@@ -687,13 +698,21 @@ def _2fa_worker(cookie, stop_event, result_box, worker_id):
                     result_box.append(link)
                     return
 
-            if stop_event.is_set() or not csrf:
+            if r1.status_code == 429:
+                _t.sleep(3)
                 continue
 
-            # Запрос 2: с CSRF
-            headers["x-csrf-token"] = csrf
-            r2 = requests.post(url, json=body_data, headers=headers, cookies=cookies, proxies=proxy, timeout=5)
-            logging.info("w#%d r2=%d body=%s", worker_id, r2.status_code, r2.text[:200])
+            if stop_event.is_set() or not csrf:
+                _t.sleep(1.2)
+                continue
+
+            # Запрос 2: с CSRF → ссылка
+            h2 = headers.copy()
+            h2["x-csrf-token"] = csrf
+            r2 = requests.post(url, json=body_data, headers=h2,
+                               cookies=cookies_jar, proxies=proxy, timeout=10)
+            req_num += 1
+            logging.info("w#%d req#%d r2=%d body=%s", worker_id, req_num, r2.status_code, r2.text[:300])
 
             if r2.status_code == 200:
                 link = _extract_api_url(r2)
@@ -702,36 +721,44 @@ def _2fa_worker(cookie, stop_event, result_box, worker_id):
                     result_box.append(link)
                     return
 
+            if r2.status_code == 429:
+                _t.sleep(3)
+                continue
+
+            # Пауза между итерациями — ~5 запросов в секунду на воркер
+            _t.sleep(1.2)
+
         except Exception as e:
             logging.warning("w#%d err: %s", worker_id, e)
+            _t.sleep(1)
+
+    logging.info("w#%d done, total reqs: %d", worker_id, req_num)
 
 
 def get_url_via_api_2fa(cookie, method):
     """
-    70 воркеров параллельно, каждый непрерывно шлёт запросы до 2 минут.
-    Итого: 70+ настоящих HTTP запросов каждые ~8 сек.
-    Первый получивший ссылку — сигнализирует всем остановиться.
+    10 воркеров — по одному на каждый прокси.
+    Каждый воркер делает ~50 запросов в минуту (пауза 1.2 сек).
+    Итого: 10 × 50 = ~500 запросов в минуту без 429.
     """
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
-    WORKERS = 70
     stop_event = threading.Event()
     result_box = []
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=len(_PROXY_LIST)) as pool:
         futures = [
-            pool.submit(_2fa_worker, cookie, stop_event, result_box, i + 1)
-            for i in range(WORKERS)
+            pool.submit(_2fa_worker, cookie, stop_event, result_box, entry, i + 1)
+            for i, entry in enumerate(_PROXY_LIST)
         ]
-        # Ждём пока stop_event не установлен или все воркеры не завершатся
         stop_event.wait(timeout=125)
 
     if result_box:
-        logging.info("2FA: success, link found")
+        logging.info("2FA: success")
         return result_box[0]
 
-    logging.error("2FA: all 70 workers exhausted, no link")
+    logging.error("2FA: all workers exhausted")
     return None
 
 
