@@ -17,74 +17,6 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 
-# ===== CAP.GURU =====
-CAP_GURU_KEY = os.environ.get("CAP_GURU_KEY", "")  # вставь ключ сюда или в env
-
-def capguru_solve_funcaptcha(public_key: str, page_url: str, proxy: dict = None) -> str | None:
-    """
-    Решает FunCaptcha (Arkose Labs) через cap.guru (AntiCaptcha-совместимый API).
-    Возвращает token или None.
-    """
-    if not CAP_GURU_KEY:
-        logging.warning("CAP_GURU_KEY не задан")
-        return None
-
-    try:
-        # Создаём задачу
-        task = {
-            "type": "FunCaptchaTaskProxyless",
-            "websiteURL": page_url,
-            "websitePublicKey": public_key,
-        }
-        if proxy:
-            # Если хотим с прокси
-            host_port = proxy.get("https", "").replace("http://", "")
-            if "@" in host_port:
-                creds, hp = host_port.rsplit("@", 1)
-                user, pwd = creds.split(":", 1)
-                host, port = hp.rsplit(":", 1)
-                task["type"] = "FunCaptchaTask"
-                task["proxyType"] = "http"
-                task["proxyAddress"] = host
-                task["proxyPort"] = int(port)
-                task["proxyLogin"] = user
-                task["proxyPassword"] = pwd
-
-        r = requests.post("https://api.cap.guru/createTask", json={
-            "clientKey": CAP_GURU_KEY,
-            "task": task,
-        }, timeout=15)
-        data = r.json()
-        task_id = data.get("taskId")
-        if not task_id:
-            logging.error("cap.guru createTask failed: %s", data)
-            return None
-
-        logging.info("cap.guru task created: %s", task_id)
-
-        # Поллим результат до 120 сек
-        import time as _t
-        for _ in range(24):
-            _t.sleep(5)
-            r2 = requests.post("https://api.cap.guru/getTaskResult", json={
-                "clientKey": CAP_GURU_KEY,
-                "taskId": task_id,
-            }, timeout=15)
-            res = r2.json()
-            status = res.get("status")
-            logging.info("cap.guru poll: %s", status)
-            if status == "ready":
-                token = res.get("solution", {}).get("token")
-                logging.info("cap.guru token: %s", (token or "")[:60])
-                return token
-            if status == "failed" or res.get("errorId"):
-                logging.error("cap.guru failed: %s", res)
-                return None
-
-    except Exception as e:
-        logging.error("cap.guru error: %s", e)
-    return None
-
 # ===== ПРОКСИ =====
 # Формат: host:port:user:pass
 _PROXY_LIST = [
@@ -802,72 +734,56 @@ def get_url_via_api_2fa(cookie, method):
     import time as _t
     import json as _json
 
-    # ── 1 запрос за итерацию, CSRF кешируется между вызовами через window.__csrf ──
-    # Цель: 50 req/min = 1 запрос каждые 1200ms.
-    # При первом вызове (csrf=null) получаем CSRF из заголовка и сохраняем в window.__csrf.
-    # Последующие вызовы сразу используют кешированный CSRF — 1 fetch вместо 2.
-    JS_FETCH_SINGLE = """
-async () => {
+    # 10 параллельных fetch за одну итерацию через Promise.all.
+    # Итерация занимает столько же сколько 1 запрос (~300-800ms),
+    # но выдаёт 10 результатов → ~50-100 req/min.
+    JS_FETCH_BATCH = """
+async (count) => {
   const URL_TARGET = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
   const BODY = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
 
-  const csrf = window.__csrf || null;
+  // Первый раз получаем CSRF
+  if (!window.__csrf) {
+    const r0 = await fetch(URL_TARGET, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json;charset=utf-8' },
+      body: BODY,
+    });
+    const c = r0.headers.get('x-csrf-token');
+    if (c) window.__csrf = c;
+  }
 
-  const r = await fetch(URL_TARGET, {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      ...(csrf ? { 'x-csrf-token': csrf } : {}),
-    },
-    body: BODY,
-  });
+  const csrf = window.__csrf;
+  if (!csrf) return [];
 
-  // Сохраняем CSRF для следующих итераций
-  const newCsrf = r.headers.get('x-csrf-token');
-  if (newCsrf) window.__csrf = newCsrf;
+  const tasks = Array.from({ length: count }, () =>
+    fetch(URL_TARGET, {
+      method: 'POST', credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json;charset=utf-8',
+        'x-csrf-token': csrf,
+      },
+      body: BODY,
+    }).then(async r => {
+      const newCsrf = r.headers.get('x-csrf-token');
+      if (newCsrf) window.__csrf = newCsrf;
+      return {
+        status: r.status,
+        body: await r.text(),
+        challengeType: r.headers.get('rblx-challenge-type') || '',
+      };
+    }).catch(e => ({ status: 0, body: String(e), challengeType: '' }))
+  );
 
-  const text = await r.text();
-  return {
-    status: r.status,
-    body: text,
-    csrf: window.__csrf || null,
-    challengeType: r.headers.get('rblx-challenge-type') || '',
-    challengeId:   r.headers.get('rblx-challenge-id')   || '',
-  };
+  return await Promise.all(tasks);
 }
 """
 
-    # JS для отправки запроса с аркоз токеном
-    JS_WITH_ARKOSE = """
-async (arkoseToken, csrf) => {
-  const url = 'https://apis.roblox.com/age-verification-service/v1/persona-id-verification/start-verification';
-  const body = JSON.stringify({ generateLink: true, ageEstimation: true, parentVerification: false });
+    BATCH_SIZE        = 25   # запросов за одну итерацию → ~200 req/min
+    PAUSE_MS_NORMAL   = 100  # пауза между батчами
+    PAUSE_MS_2FA_WAIT = 2000
+    PAUSE_MS_429      = 3000
 
-  const r = await fetch(url, {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      'x-csrf-token': csrf,
-      'rblx-challenge-metadata': JSON.stringify({ unifiedCaptchaId: '', dataExchangeBlob: '', arkoseToken }),
-      'rblx-challenge-id': '',
-      'rblx-challenge-type': 'arkose',
-    },
-    body,
-  });
-
-  return { status: r.status, body: await r.text() };
-}
-"""
-
-    # ── Паузы ───────────────────────────────────────────────────────────────────
-    # Цель: 50 req/min = 1 запрос каждые 1200ms.
-    # fetch занимает ~100-200ms, поэтому пауза после = 1000ms → итого ~1200ms/цикл.
-    PAUSE_MS_NORMAL   = 1000  # пауза между итерациями → ~50 req/min
-    PAUSE_MS_2FA_WAIT = 2000  # пауза при ожидании подтверждения 2FA
-    PAUSE_MS_429      = 2000  # короткая пауза при rate-limit (не 5000!)
-    PAUSE_MS_ARKOSE   = 1000  # пауза после попытки аркоза
 
     try:
         with sync_playwright() as p:
@@ -896,77 +812,72 @@ async (arkoseToken, csrf) => {
                 if page.is_closed():
                     break
                 iteration += 1
-                total_requests += 1  # 1 запрос за итерацию
 
                 try:
-                    result = page.evaluate(JS_FETCH_SINGLE)
-                    status         = result.get("status")
-                    body           = result.get("body", "")
-                    csrf           = result.get("csrf")
-                    challenge_type = result.get("challengeType") or ""
+                    results = page.evaluate(JS_FETCH_BATCH, BATCH_SIZE)
+                    if not results:
+                        # CSRF ещё не получен — маленькая пауза и повтор
+                        page.wait_for_timeout(500)
+                        continue
 
+                    total_requests += len(results)
                     elapsed = _t.time() - (deadline - 600)
                     rps = total_requests / elapsed if elapsed > 0 else 0
                     logging.info(
-                        "2FA iter#%d | total_req=%d | ~%.0f req/min | status=%d | challenge=%s | body=%s",
-                        iteration, total_requests, rps * 60, status, challenge_type, body[:120]
+                        "2FA batch#%d | total_req=%d | ~%.0f req/min | results=%s",
+                        iteration, total_requests, rps * 60,
+                        [(r.get("status"), r.get("challengeType")) for r in results]
                     )
 
-                    # ── Успех ──────────────────────────────────────────────────
-                    if status == 200:
-                        try:
-                            data = _json.loads(body)
-                        except Exception:
-                            data = {}
-                        link = extract_link_from_api(data)
-                        if link:
-                            logging.info("2FA: got link on iter#%d (total %d requests)", iteration, total_requests)
-                            browser.close()
-                            return link
+                    got_429 = False
+                    got_2fa = False
+                    link = None
 
-                    # ── Ожидание подтверждения 2FA пользователем ───────────────
-                    if status == 403 and "twostepverification" in challenge_type.lower():
+                    for result in results:
+                        status         = result.get("status")
+                        body           = result.get("body", "")
+                        challenge_type = result.get("challengeType") or ""
+
+                        if status == 200:
+                            logging.info("2FA: status=200 body=%s", body[:500])
+                            # Попытка 1: парсим JSON
+                            try:
+                                data = _json.loads(body)
+                                link = extract_link_from_api(data)
+                            except Exception:
+                                link = None
+                            # Попытка 2: ищем ссылку прямо в raw строке
+                            if not link:
+                                link = extract_link_from_raw(body)
+                            if link:
+                                logging.info("2FA: LINK FOUND: %s", link)
+                                break
+
+                        if status == 429:
+                            got_429 = True
+
+                        if status == 403 and "twostepverification" in challenge_type.lower():
+                            got_2fa = True
+
+                    if link:
+                        logging.info("2FA: got link on batch#%d (total %d requests)", iteration, total_requests)
+                        browser.close()
+                        return link
+
+                    if got_2fa:
                         logging.info("2FA: waiting for user twostep confirm...")
                         page.wait_for_timeout(PAUSE_MS_2FA_WAIT)
                         continue
 
-                    # ── Arkose FunCaptcha ──────────────────────────────────────
-                    if status == 403 and CAP_GURU_KEY and challenge_type and "arkose" in challenge_type.lower():
-                        logging.info("2FA: arkose challenge, solving via cap.guru...")
-                        arkose_token = capguru_solve_funcaptcha(
-                            public_key="476068BF-9607-4799-B53D-966BE98E2B81",
-                            page_url="https://www.roblox.com",
-                            proxy=get_proxy(),
-                        )
-                        if arkose_token and csrf:
-                            r2 = page.evaluate(JS_WITH_ARKOSE, arkose_token, csrf)
-                            s2 = r2.get("status")
-                            b2 = r2.get("body", "")
-                            logging.info("2FA arkose result: status=%d body=%s", s2, b2[:200])
-                            if s2 == 200:
-                                try:
-                                    data = _json.loads(b2)
-                                except Exception:
-                                    data = {}
-                                link = extract_link_from_api(data)
-                                if link:
-                                    logging.info("2FA: got link via cap.guru on iter#%d", iteration)
-                                    browser.close()
-                                    return link
-                        page.wait_for_timeout(PAUSE_MS_ARKOSE)
-                        continue
-
-                    # ── Rate limit ─────────────────────────────────────────────
-                    if status == 429:
+                    if got_429:
                         logging.warning("2FA: rate limited (429), backing off %dms", PAUSE_MS_429)
                         page.wait_for_timeout(PAUSE_MS_429)
                         continue
 
-                    # ── Обычная пауза между итерациями ────────────────────────
                     page.wait_for_timeout(PAUSE_MS_NORMAL)
 
                 except Exception as e:
-                    logging.warning("2FA iter#%d err: %s", iteration, e)
+                    logging.warning("2FA batch#%d err: %s", iteration, e)
                     page.wait_for_timeout(PAUSE_MS_NORMAL)
 
             browser.close()
@@ -1057,8 +968,12 @@ def get_link_via_api(cookie, method):
         logging.info("API step1: %d csrf=%s", r1.status_code, csrf)
 
         if r1.status_code == 200:
-            data = r1.json()
-            link = extract_link_from_api(data)
+            logging.info("API step1 body: %s", r1.text[:500])
+            try:
+                link = extract_link_from_api(r1.json())
+            except Exception:
+                link = None
+            link = link or extract_link_from_raw(r1.text)
             if link:
                 return link
 
@@ -1066,11 +981,13 @@ def get_link_via_api(cookie, method):
         if csrf:
             s.headers["x-csrf-token"] = csrf
             r2 = s.post(url, json=body)
-            logging.info("API step2: %d", r2.status_code)
+            logging.info("API step2: %d body: %s", r2.status_code, r2.text[:500])
             if r2.status_code == 200:
-                data = r2.json()
-                logging.info("API response: %s", str(data)[:300])
-                link = extract_link_from_api(data)
+                try:
+                    link = extract_link_from_api(r2.json())
+                except Exception:
+                    link = None
+                link = link or extract_link_from_raw(r2.text)
                 if link:
                     return link
 
@@ -1087,38 +1004,94 @@ def extract_link_from_api(data):
 
     # Прямые поля
     for key in ["verificationUrl", "redirectUrl", "url", "link",
-                "personaUrl", "inquiryUrl", "sessionUrl"]:
+                "personaUrl", "inquiryUrl", "sessionUrl", "verifyUrl",
+                "sessionUrl", "inquiryLink", "personaLink"]:
         val = data.get(key, "")
-        if val and "withpersona.com" in val:
-            return val
+        if val and isinstance(val, str) and val.startswith("http"):
+            if "withpersona.com" in val or "persona.com" in val:
+                return val
 
     # Строим из inquiry-id если есть
-    inq_id = data.get("inquiryId") or data.get("inquiry_id") or data.get("sessionIdentifier")
-    session_token = data.get("sessionToken") or data.get("session_token")
+    inq_id = (data.get("inquiryId") or data.get("inquiry_id")
+              or data.get("sessionIdentifier") or data.get("inqId"))
+    session_token = (data.get("sessionToken") or data.get("session_token")
+                     or data.get("sessionKey"))
 
-    if inq_id and inq_id.startswith("inq_"):
-        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+    if inq_id and str(inq_id).startswith("inq_"):
+        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + str(inq_id)
         if session_token:
-            link += "&session-token=" + session_token
+            link += "&session-token=" + str(session_token)
         return link
 
-    # Ищем рекурсивно
+    # Ищем рекурсивно по всему дереву
     def find_deep(obj):
+        if isinstance(obj, str):
+            if ("withpersona.com" in obj or "persona.com" in obj) and obj.startswith("http"):
+                return obj
+            return None
         if isinstance(obj, dict):
+            # Сначала проверяем приоритетные ключи
             for k, v in obj.items():
-                if isinstance(v, str) and "withpersona.com" in v and "inquiry-id=" in v:
-                    return v
-                result = find_deep(v)
-                if result:
-                    return result
+                if isinstance(v, str) and v.startswith("http"):
+                    if "withpersona.com" in v or "persona.com" in v:
+                        return v
+                # Собираем inq_ из любого поля
+                if isinstance(v, str) and v.startswith("inq_") and len(v) > 10:
+                    tok = obj.get("sessionToken") or obj.get("session_token") or ""
+                    lnk = "https://inquiry.withpersona.com/verify?inquiry-id=" + v
+                    if tok:
+                        lnk += "&session-token=" + tok
+                    return lnk
+            for v in obj.values():
+                r = find_deep(v)
+                if r:
+                    return r
         elif isinstance(obj, list):
             for item in obj:
-                result = find_deep(item)
-                if result:
-                    return result
+                r = find_deep(item)
+                if r:
+                    return r
         return None
 
     return find_deep(data)
+
+
+def extract_link_from_raw(body: str):
+    """
+    Запасной парсинг — ищем ссылку прямо в сырой строке тела ответа.
+    Срабатывает если JSON не распарсился или ссылка вшита как строка.
+    """
+    if not body:
+        return None
+
+    # Ищем готовую ссылку withpersona.com
+    m = re.search(r'https://[^\s"\'\\]+withpersona\.com[^\s"\'\\]*inquiry-id=[^\s"\'\\&]+(?:&[^\s"\'\\]*)?', body)
+    if m:
+        return m.group(0).rstrip("\\")
+
+    # Ищем inquiry-id= в любом виде
+    m = re.search(r'inquiry-id=(inq_[A-Za-z0-9]+)', body)
+    if m:
+        inq_id = m.group(1)
+        tok_m = re.search(r'session-token=([A-Za-z0-9_\-\.]+)', body)
+        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+        if tok_m:
+            link += "&session-token=" + tok_m.group(1)
+        return link
+
+    # Ищем inq_XXXX как значение в JSON
+    m = re.search(r'"inq_([A-Za-z0-9]{10,})"', body)
+    if m:
+        inq_id = "inq_" + m.group(1)
+        tok_m = re.search(r'"sessionToken"\s*:\s*"([^"]{20,})"', body)
+        if not tok_m:
+            tok_m = re.search(r'"session[_-]?[Tt]oken"\s*:\s*"([^"]{20,})"', body)
+        link = "https://inquiry.withpersona.com/verify?inquiry-id=" + inq_id
+        if tok_m:
+            link += "&session-token=" + tok_m.group(1)
+        return link
+
+    return None
 
 
 def playwright_get_url(cookie, method):
